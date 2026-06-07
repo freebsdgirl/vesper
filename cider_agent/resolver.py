@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import httpx
 
+from .action_registry import list_action_definitions
 from .config import Settings
 from .errors import ResolverError
 
@@ -137,16 +138,31 @@ class OpenAICompatibleResolver:
         candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))[: self.MAX_SESSION_CANDIDATE_ARTISTS]
         candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))[: self.MAX_SESSION_CANDIDATE_QUERIES]
         artist_seed = self._extract_artist_seed(request)
+        hard_artist_constraint = self._extract_hard_artist_constraint(request)
+        if hard_artist_constraint and hard_artist_constraint not in candidate_artists:
+            candidate_artists = [hard_artist_constraint, *candidate_artists][: self.MAX_SESSION_CANDIDATE_ARTISTS]
         if artist_seed and artist_seed not in candidate_artists:
             candidate_artists = [artist_seed, *candidate_artists][: self.MAX_SESSION_CANDIDATE_ARTISTS]
         if artist_seed and not self._request_mentions_specific_track(request):
             candidate_tracks = []
         if artist_seed and not candidate_queries:
             candidate_queries = [artist_seed]
+        if hard_artist_constraint:
+            candidate_queries = [
+                query for query in candidate_queries if self._query_preserves_artist_constraint(query, hard_artist_constraint)
+            ]
+            if not candidate_queries:
+                candidate_queries = [hard_artist_constraint]
         if not candidate_queries:
             synthesized = self._fallback_query_from_text(request)
             if synthesized:
                 candidate_queries = [synthesized]
+        if hard_artist_constraint:
+            candidate_queries = [
+                query for query in candidate_queries if self._query_preserves_artist_constraint(query, hard_artist_constraint)
+            ]
+            if not candidate_queries:
+                candidate_queries = [hard_artist_constraint]
         candidate_queries = candidate_queries[: self.MAX_SESSION_CANDIDATE_QUERIES]
         return SessionPlan(
             candidate_tracks=candidate_tracks,
@@ -172,38 +188,14 @@ class OpenAICompatibleResolver:
             "active_session": active_session,
             "preferences": service.list_preferences()["preferences"][:5],
             "supported_actions": [
-                "status",
-                "get_now_playing",
-                "play",
-                "pause",
-                "playpause",
-                "stop",
-                "next_track",
-                "previous_track",
-                "seek",
-                "get_volume",
-                "set_volume",
-                "get_queue",
-                "remove_queue_item",
-                "clear_queue",
-                "play_url",
-                "search",
-                "search_catalog",
-                "search_library",
-                "search_catalog_tracks",
-                "search_library_tracks",
-                "play_candidate_match",
-                "play_session",
-                "steer_session",
-                "reject_current_track",
-                "session_status",
-                "stop_session",
-                "play_search_result",
-                "remember_preference",
-                "list_preferences",
-                "forget_preference",
-                "recommend",
-                "play_recommendation",
+                {
+                    "name": definition.name,
+                    "description": definition.description,
+                    "required_fields": list(definition.required_fields),
+                    "read_only": definition.read_only,
+                    "session_aware": definition.session_aware,
+                }
+                for definition in list_action_definitions(text_exposable_only=True)
             ],
             "notes": [
                 "Return JSON only with keys action and parameters.",
@@ -449,6 +441,32 @@ class OpenAICompatibleResolver:
             if candidate and not self._request_mentions_specific_track(text):
                 return candidate
         return None
+
+    def _extract_hard_artist_constraint(self, text: str) -> str | None:
+        direct = self._extract_artist_seed(text)
+        if direct:
+            return direct
+        patterns = [
+            r"\bwith\s+(.+?)\s+vibes?\b",
+            r"\b(.+?)\s+vibes?\b",
+            r"\bin\s+the\s+style\s+of\s+(.+?)\b",
+            r"\blike\s+(.+?)\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip(" .,:;!?\"'")
+            candidate = re.sub(r"^(some|something|music)\s+", "", candidate, flags=re.IGNORECASE).strip()
+            candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate and not self._request_mentions_specific_track(candidate):
+                return candidate
+        return None
+
+    def _query_preserves_artist_constraint(self, query: str, artist: str) -> bool:
+        query_norm = self._normalize_query_text(query).casefold()
+        artist_norm = self._normalize_query_text(artist).casefold()
+        return bool(query_norm and artist_norm and artist_norm in query_norm)
 
     def _request_mentions_specific_track(self, text: str) -> bool:
         lowered = text.casefold()

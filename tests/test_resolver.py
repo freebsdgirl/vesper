@@ -605,6 +605,55 @@ def test_session_plan_caps_candidate_lists(settings: Settings, service) -> None:
     assert plan.candidate_queries == ["query one"]
 
 
+def test_session_plan_preserves_named_artist_constraint_in_fallback_queries(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class VibesTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "candidate_tracks": [{"title": "Nandemonaiya (Piano Version)", "artist": "RADWIMPS"}],
+                                    "candidate_artists": [],
+                                    "candidate_queries": ["cinematic piano music with emotive melodies"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=VibesTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    plan = resolver.plan_session("piano music with radwimps vibes", service, {"request_text": "piano music with radwimps vibes"}, 3)
+
+    assert plan.candidate_artists == ["radwimps"]
+    assert plan.candidate_queries == ["radwimps"]
+
+
 def test_play_session_request_text_is_normalized_to_request(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,

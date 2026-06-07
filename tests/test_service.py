@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from cider_agent.action_registry import get_action_definition
 from cider_agent.config import Settings
 from cider_agent.errors import CiderRpcError, CiderValidationError, TextRequestExecutionError
 from cider_agent.resolver import ResolvedAction
@@ -47,6 +48,16 @@ def test_run_action_dispatches_search(service) -> None:
 
     assert result["action"] == "search_library_tracks"
     assert result["result"]["count"] == 1
+
+
+def test_action_registry_defines_exported_actions(service) -> None:
+    definitions = {item["name"]: item for item in service.list_action_definitions()}
+
+    assert "status" in definitions
+    assert "play_session" in definitions
+    assert definitions["status"]["read_only"] is True
+    assert definitions["play_session"]["session_aware"] is True
+    assert get_action_definition("search_library_tracks") is not None
 
 
 def test_set_volume_normalizes_percent_for_cider(service) -> None:
@@ -349,6 +360,60 @@ def test_reject_current_track_advances_active_session_without_changing_vibe(serv
     assert result["result"]["tracks"][0]["title"] == "Another Song"
 
 
+def test_failed_session_start_does_not_leave_active_session(settings, service, tmp_path) -> None:
+    class NoMatchResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "candidate_tracks": [{"title": "Nope", "artist": "Nobody"}],
+                    "candidate_artists": [],
+                    "candidate_queries": [],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+    failing_service = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=tmp_path / "failed-session-start.db",
+            config_path=settings.config_path,
+        ),
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(tmp_path / "failed-session-start.db"),
+        resolver=NoMatchResolver(),
+    )
+
+    with pytest.raises(CiderValidationError, match="No playable candidate match could be resolved."):
+        failing_service.play_session("piano music with radwimps vibes")
+
+    assert failing_service._preferences.get_active_session() is None
+
+
 def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_path) -> None:
     class RepeatingPlanResolver:
         def __init__(self) -> None:
@@ -413,6 +478,79 @@ def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_p
 
     second = repeat_service.play_session("play upbeat music again")
     assert second["result"]["tracks"][0]["title"] == "Another Song"
+
+
+def test_collect_session_tracks_relaxes_global_recent_exclusions_when_needed(settings, service, tmp_path) -> None:
+    class SameTrackResolver:
+        def resolve(self, text: str, service) -> ResolvedAction:
+            return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
+
+        def plan_session(self, request: str, service: CiderAgentService, session: dict[str, object], count: int):
+            return type(
+                "Plan",
+                (),
+                {
+                    "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+                    "candidate_artists": [],
+                    "candidate_queries": [request],
+                    "resolver": "stub",
+                    "raw": None,
+                    "reasoning": None,
+                    "raw_content": None,
+                },
+            )()
+
+    relaxed_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend=settings.resolver_backend,
+        resolver_base_url=settings.resolver_base_url,
+        resolver_model=settings.resolver_model,
+        resolver_api_key=settings.resolver_api_key,
+        resolver_include_reasoning=settings.resolver_include_reasoning,
+        resolver_include_raw_output=settings.resolver_include_raw_output,
+        include_timing_debug=True,
+        response_detail=settings.response_detail,
+        session_recent_tracks_limit=5,
+        global_recent_tracks_limit=10,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=tmp_path / "relax-global-recent.db",
+        config_path=settings.config_path,
+    )
+    relaxed_service = CiderAgentService(
+        relaxed_settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(relaxed_settings.database_path),
+        resolver=SameTrackResolver(),
+    )
+
+    first = relaxed_service.play_session("play upbeat music")
+    assert first["result"]["tracks"][0]["title"] == "Liked Song"
+    relaxed_service.stop_session()
+    relaxed_service._rpc.current_track = None
+
+    session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
+    plan = type(
+        "Plan",
+        (),
+        {
+            "candidate_tracks": [{"title": "Liked Song", "artist": "Favorite Artist"}],
+            "candidate_artists": [],
+            "candidate_queries": [],
+        },
+    )()
+    timings: dict[str, object] = {}
+
+    tracks = relaxed_service._collect_session_tracks(session, plan, limit=1, timings=timings)
+
+    assert tracks[0]["title"] == "Liked Song"
+    assert timings["relaxed_global_recent_exclusions"] is True
 
 
 def test_top_pool_order_randomizes_within_small_high_confidence_bucket(service) -> None:
@@ -653,6 +791,254 @@ def test_play_candidate_match_prefers_track_candidate(service) -> None:
     assert result["selected_track"]["play_params"]["id"] == "catalog-track-favorite"
 
 
+def test_collect_session_tracks_uses_track_artist_as_fallback_artist(settings, service, tmp_path) -> None:
+    class RadwimpsRpcClient:
+        def close(self) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            if path == "/now-playing":
+                return {"info": {}}
+            if path == "/queue":
+                return []
+            if path == "/is-playing":
+                return {"status": "ok", "is_playing": False}
+            if path == "/volume":
+                return {"volume": 0.5}
+            if path == "/repeat-mode":
+                return {"value": 0}
+            if path == "/shuffle-mode":
+                return {"value": 0}
+            if path == "/autoplay":
+                return {"value": False}
+            return {"value": True}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str):
+            if query == "RADWIMPS Nandemonaiya (Piano Version)":
+                return {"data": {"results": {"songs": {"data": []}}}}
+            if query == "RADWIMPS":
+                return {
+                    "data": {
+                        "results": {
+                            "songs": {
+                                "data": [
+                                    {
+                                        "id": "radwimps-track-1",
+                                        "type": "songs",
+                                        "attributes": {
+                                            "name": "Nandemonaiya",
+                                            "artistName": "RADWIMPS",
+                                            "albumName": "Your Name.",
+                                            "playParams": {"id": "radwimps-track-1", "kind": "songs", "isLibrary": False},
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "wrong-track-1",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Sakura (Cover)",
+                                        "artistName": "Relax Lab",
+                                        "albumName": "Piano Covers",
+                                        "playParams": {"id": "wrong-track-1", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+
+    fallback_service = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            include_timing_debug=True,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=tmp_path / "radwimps-fallback.db",
+            config_path=settings.config_path,
+        ),
+        rpc_client=RadwimpsRpcClient(),
+        preference_store=PreferenceStore(tmp_path / "radwimps-fallback.db"),
+        resolver=service._resolver,
+    )
+    session = {"id": 1, "request_text": "piano music with radwimps vibes", "steering_history": []}
+    plan = type(
+        "Plan",
+        (),
+        {
+            "candidate_tracks": [{"title": "Nandemonaiya (Piano Version)", "artist": "RADWIMPS"}],
+            "candidate_artists": [],
+            "candidate_queries": ["emotional piano music radwimps style"],
+        },
+    )()
+
+    tracks = fallback_service._collect_session_tracks(session, plan, limit=1)
+
+    assert tracks[0]["artist"] == "RADWIMPS"
+    assert tracks[0]["title"] == "Nandemonaiya"
+
+
+def test_best_track_match_accepts_title_variants(service) -> None:
+    tracks = [
+        {
+            "title": "Sparkle",
+            "artist": "RADWIMPS",
+        },
+        {
+            "title": "Dream Lantern",
+            "artist": "RADWIMPS",
+        },
+    ]
+
+    match = service._best_track_match(tracks, title="Sparkle (Piano Version)", artist="RADWIMPS")
+
+    assert match is not None
+    assert match["title"] == "Sparkle"
+
+
+def test_collect_session_tracks_rejects_generic_query_fallback_when_artist_constraint_exists(settings, service, tmp_path) -> None:
+    class ConstraintRpcClient:
+        def close(self) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            if path == "/now-playing":
+                return {"info": {}}
+            if path == "/queue":
+                return []
+            if path == "/is-playing":
+                return {"status": "ok", "is_playing": False}
+            if path == "/volume":
+                return {"volume": 0.5}
+            if path == "/repeat-mode":
+                return {"value": 0}
+            if path == "/shuffle-mode":
+                return {"value": 0}
+            if path == "/autoplay":
+                return {"value": False}
+            return {"value": True}
+
+        def playback_post(self, path: str, body=None):
+            return {"path": path, "body": body}
+
+        def search_catalog(self, query: str, *, limit: int, storefront: str):
+            if query == "RADWIMPS Nandemonaiya (Piano Version)":
+                return {"data": {"results": {"songs": {"data": []}}}}
+            if query == "RADWIMPS":
+                return {
+                    "data": {
+                        "results": {
+                            "songs": {
+                                "data": [
+                                    {
+                                        "id": "radwimps-track-1",
+                                        "type": "songs",
+                                        "attributes": {
+                                            "name": "Sparkle",
+                                            "artistName": "RADWIMPS",
+                                            "albumName": "Your Name.",
+                                            "playParams": {"id": "radwimps-track-1", "kind": "songs", "isLibrary": False},
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    }
+                }
+            return {
+                "data": {
+                    "results": {
+                        "songs": {
+                            "data": [
+                                {
+                                    "id": "wrong-track-1",
+                                    "type": "songs",
+                                    "attributes": {
+                                        "name": "Emotional Lofi Piano",
+                                        "artistName": "LoFi Hip Hop",
+                                        "albumName": "Japanese Lofi Hip Hop Beats",
+                                        "playParams": {"id": "wrong-track-1", "kind": "songs", "isLibrary": False},
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+
+    constrained_service = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            include_timing_debug=True,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=tmp_path / "constraint-artist.db",
+            config_path=settings.config_path,
+        ),
+        rpc_client=ConstraintRpcClient(),
+        preference_store=PreferenceStore(tmp_path / "constraint-artist.db"),
+        resolver=service._resolver,
+    )
+    session = {"id": 1, "request_text": "piano music with radwimps vibes", "steering_history": []}
+    plan = type(
+        "Plan",
+        (),
+        {
+            "candidate_tracks": [{"title": "Nandemonaiya (Piano Version)", "artist": "RADWIMPS"}],
+            "candidate_artists": [],
+            "candidate_queries": ["cinematic piano music with emotive melodies"],
+        },
+    )()
+
+    tracks = constrained_service._collect_session_tracks(session, plan, limit=1)
+
+    assert tracks[0]["artist"] == "RADWIMPS"
+    assert tracks[0]["title"] == "Sparkle"
+
+
 def test_run_action_compacts_track_payloads_by_default(service) -> None:
     result = service.run_action(
         "play_candidate_match",
@@ -689,3 +1075,165 @@ def test_status_handles_is_playing_payload_shape(service) -> None:
     result = service.status()
 
     assert result["playback"]["is_playing"] is True
+
+
+def test_paused_session_runtime_survives_restart(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "paused-restart.db"
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    first.pause()
+
+    restarted = CiderAgentService(
+        first._settings,
+        rpc_client=first._rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+
+    session = restarted._preferences.get_active_session()
+    assert session is not None
+    assert restarted._get_session_runtime(session["id"])["suspended"] is True
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
+
+
+def test_active_stopped_session_can_continue_after_restart(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "active-restart.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    rpc.is_playing = False
+    rpc.current_track = None
+
+    restarted = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+
+    session = restarted._preferences.get_active_session()
+    assert session is not None
+    assert restarted._get_session_runtime(session["id"])["suspended"] is False
+    restarted._set_session_runtime(session["id"], last_advance_at=0.0)
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
+
+
+def test_reconcile_without_active_session_has_no_runtime(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "no-active-session.db"
+    restarted = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+
+    assert restarted._preferences.get_active_session() is None
+    assert restarted._session_runtime == {}
+
+
+def test_session_events_distinguish_rejection_steering_skip_and_auto_advance(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service.steer_session("more pop")
+    service.reject_current_track()
+    service.next_track()
+
+    second_service = service.__class__(
+        service._settings,
+        rpc_client=service._rpc.__class__(),
+        preference_store=PreferenceStore(service._settings.database_path.parent / "event-auto-advance.db"),
+        resolver=service._resolver.__class__(),
+    )
+    second_service.play_session("play upbeat music")
+    second_session = second_service._preferences.get_active_session()
+    assert second_session is not None
+    second_service._rpc.is_playing = False
+    second_service._rpc.current_track = None
+    second_service._set_session_runtime(second_session["id"], last_advance_at=0.0)
+    second_service._play_session_track(second_session, selection_strategy="adaptive-session-auto-advance")
+
+    event_types = [event["event_type"] for event in service._preferences.list_session_events(session["id"], limit=20)]
+    event_types.extend(
+        event["event_type"] for event in second_service._preferences.list_session_events(second_session["id"], limit=20)
+    )
+
+    assert "session_steered" in event_types
+    assert "track_rejected" in event_types
+    assert "track_manually_steered" in event_types
+    assert "track_manual_skip" in event_types
+    assert "track_auto_advanced" in event_types

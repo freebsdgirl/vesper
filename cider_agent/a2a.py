@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -17,8 +16,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .action_registry import get_action_definition, match_text_action_definition
 from .app import get_service, get_settings
 from .errors import CiderAgentError, CiderValidationError, TextRequestExecutionError
+from .renderers import render_action_result_for_a2a, render_text_result_for_a2a
 
 
 def _iso_now() -> str:
@@ -74,39 +75,6 @@ class TaskStore:
 
 
 TASK_STORE = TaskStore()
-
-READ_ONLY_ACTIONS = {
-    "status",
-    "get_now_playing",
-    "playback_snapshot",
-    "is_playing",
-    "get_volume",
-    "get_repeat_mode",
-    "get_shuffle_mode",
-    "get_autoplay",
-    "get_queue",
-    "session_status",
-    "search",
-    "search_catalog",
-    "search_library",
-    "search_catalog_tracks",
-    "search_library_tracks",
-    "list_library_playlists",
-    "search_library_playlists",
-    "get_library_playlist",
-    "get_library_playlist_tracks",
-    "list_preferences",
-    "recommend",
-    "list_recently_played",
-}
-
-READ_ONLY_TEXT_PATTERNS = [
-    r"^\s*status\s*$",
-    r"^\s*what('?s| is)\s+playing\??\s*$",
-    r"^\s*now\s+playing\??\s*$",
-    r"^\s*session\s+status\??\s*$",
-    r"^\s*queue\s+status\??\s*$",
-]
 
 
 def build_agent_card() -> dict[str, Any]:
@@ -164,11 +132,13 @@ def _jsonrpc_error(code: int, message: str, data: Any = None) -> dict[str, Any]:
 
 
 def _is_read_only_action(action: str) -> bool:
-    return action in READ_ONLY_ACTIONS
+    definition = get_action_definition(action)
+    return bool(definition and definition.read_only)
 
 
 def _is_read_only_text_request(text: str) -> bool:
-    return any(re.match(pattern, text, flags=re.IGNORECASE) for pattern in READ_ONLY_TEXT_PATTERNS)
+    definition = match_text_action_definition(text)
+    return bool(definition and definition.read_only)
 
 
 def _should_defer_message(message: dict[str, Any]) -> bool:
@@ -191,7 +161,7 @@ def _resolve_defer_mode(message: dict[str, Any], params: dict[str, Any]) -> bool
     return _should_defer_message(message)
 
 
-def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], dict[str, Any] | None]:
+def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[str, Any], Any | None]:
     parts = message.get("parts", [])
     for part in parts:
         if not isinstance(part, dict):
@@ -208,9 +178,8 @@ def _extract_action(message: dict[str, Any], service: Any) -> tuple[str, dict[st
                 raise CiderValidationError("parameters must be an object.")
             return action, parameters, None
         if part.get("kind") == "text":
-            resolved = service.handle_text_request(str(part.get("text", "")))
-            execution = resolved["execution"]
-            return execution["action"], execution["result"], resolved
+            resolved = service.execute_text_request(str(part.get("text", "")))
+            return resolved.execution.action, resolved.execution.result, resolved
     raise CiderValidationError("Message did not include a supported text or data part.")
 
 
@@ -300,9 +269,12 @@ def _failed_task(
 def _execute_message(message: dict[str, Any], *, task_id: str | None = None, context_id: str | None = None) -> dict[str, Any]:
     service = get_service()
     action, parameters, resolved = _extract_action(message, service)
-    payload = parameters if resolved is not None else service.run_action(action, parameters)
     resolved_task_id = task_id or str(uuid.uuid4())
     resolved_context_id = context_id or str(uuid.uuid4())
+    if resolved is not None:
+        payload, metadata = render_text_result_for_a2a(resolved)
+    else:
+        payload, metadata = render_action_result_for_a2a(service.execute_action(action, parameters))
     task = _task_from_result(
         task_id=resolved_task_id,
         context_id=resolved_context_id,
@@ -310,15 +282,7 @@ def _execute_message(message: dict[str, Any], *, task_id: str | None = None, con
         action=action,
         payload=payload,
     )
-    if resolved is not None:
-        task["metadata"]["resolver"] = resolved["resolver"]
-        task["metadata"]["resolved_action"] = resolved["resolved_action"]
-        if "reasoning" in resolved:
-            task["metadata"]["reasoning"] = resolved["reasoning"]
-        if "resolver_raw_content" in resolved:
-            task["metadata"]["resolver_raw_content"] = resolved["resolver_raw_content"]
-        if "resolver_raw_action" in resolved:
-            task["metadata"]["resolver_raw_action"] = resolved["resolver_raw_action"]
+    task["metadata"].update(metadata)
     TASK_STORE.save(task)
     return task
 

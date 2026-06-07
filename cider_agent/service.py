@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime
 import logging
-import uuid
 from dataclasses import dataclass
 import random
 import threading
@@ -14,7 +13,9 @@ from urllib.parse import quote
 import re
 
 from .config import Settings
+from .action_registry import get_action_definition, list_action_definitions
 from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
+from .results import EngineActionResult, TextRequestResult
 from .resolver import ResolvedAction, Resolver, SessionPlan, build_resolver
 from .rpc import CiderRpcClient
 from .storage import PreferenceStore
@@ -103,11 +104,48 @@ def _normalize_match_text(value: str | None) -> str:
     return " ".join(normalized.split())
 
 
+def _normalize_title_match_text(value: str | None) -> str:
+    if value is None:
+        return ""
+    simplified = re.sub(r"\([^)]*\)|\[[^\]]*\]", " ", value)
+    simplified = re.sub(
+        r"\s+-\s+(version|ver|movie ver|movie version|instrumental|cover|edit|mix|remaster(?:ed)?)\b.*$",
+        "",
+        simplified,
+        flags=re.IGNORECASE,
+    )
+    return _normalize_match_text(simplified)
+
+
 def _clean_id(value: Any) -> str:
     if value is None:
         return ""
     cleaned = str(value).strip()
     return "" if cleaned.lower() == "none" else cleaned
+
+
+def _extract_constraint_artist(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    patterns = [
+        r"\bwith\s+(.+?)\s+vibes?\b",
+        r"\b(.+?)\s+vibes?\b",
+        r"\bin\s+the\s+style\s+of\s+(.+?)\b",
+        r"\blike\s+(.+?)\b",
+        r"^\s*play\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
+        r"^\s*more\s+of\s+(.+?)\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        candidate = match.group(1).strip(" .,:;!?\"'")
+        candidate = re.sub(r"^(some|something|music)\s+", "", candidate, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
+        if candidate:
+            return candidate
+    return None
 
 
 @dataclass
@@ -218,6 +256,7 @@ class CiderAgentService:
         self._session_runtime: dict[int, dict[str, Any]] = {}
         self._session_advance_lock = threading.Lock()
         self._random = random.SystemRandom()
+        self.reconcile_session_runtime()
 
     def close(self) -> None:
         self.stop_background_session_worker()
@@ -243,6 +282,48 @@ class CiderAgentService:
 
     def current_timestamp(self) -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    def list_action_definitions(self, *, text_exposable_only: bool = False) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": definition.name,
+                "description": definition.description,
+                "summary_label": definition.summary_label,
+                "parameter_schema": definition.parameter_schema,
+                "required_fields": list(definition.required_fields),
+                "read_only": definition.read_only,
+                "text_exposable": definition.text_exposable,
+                "session_aware": definition.session_aware,
+                "deferred_a2a_eligible": definition.deferred_a2a_eligible,
+                "advanced_only": definition.advanced_only,
+            }
+            for definition in list_action_definitions(text_exposable_only=text_exposable_only)
+        ]
+
+    def reconcile_session_runtime(self) -> None:
+        session = self._preferences.get_active_session()
+        self._clear_all_session_runtime()
+        if session is None:
+            return
+        stored_runtime = self._preferences.get_session_runtime(session["id"]) or {}
+        playback = self.playback_snapshot()
+        suspended = stored_runtime.get("active_intent") == "suspended"
+        self._set_session_runtime(
+            session["id"],
+            suspended=suspended,
+            last_advance_at=stored_runtime.get("last_advance_at"),
+            last_selected_track_id=stored_runtime.get("last_selected_track_id"),
+            last_known_playback_state=stored_runtime.get("last_known_playback_state"),
+        )
+        self._persist_session_runtime(
+            session["id"],
+            suspended=suspended,
+            last_selected_track_id=stored_runtime.get("last_selected_track_id"),
+            last_known_playback_state="playing" if playback.get("is_playing") else "stopped",
+            preserve_last_advance=True,
+        )
+        if playback.get("is_playing"):
+            self._record_current_track_for_session(session, playback=playback, event_type="track_started")
 
     def start_background_session_worker(self) -> None:
         with self._session_worker_lock:
@@ -351,6 +432,8 @@ class CiderAgentService:
         session = self._preferences.get_active_session()
         if session is not None:
             self._set_session_runtime(session["id"], suspended=False)
+            self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
+            self._preferences.add_session_event(session["id"], event_type="session_resumed")
             snapshot = self.playback_snapshot()
             if snapshot.get("is_playing"):
                 return {"status": "ok", "result": self._rpc.playback_post("/play")}
@@ -363,6 +446,8 @@ class CiderAgentService:
         session = self._preferences.get_active_session()
         if session is not None:
             self._set_session_runtime(session["id"], suspended=True)
+            self._persist_session_runtime(session["id"], suspended=True, last_known_playback_state="paused")
+            self._preferences.add_session_event(session["id"], event_type="session_suspended")
         return {"status": "ok", "result": self._rpc.playback_post("/pause")}
 
     def playpause(self) -> dict[str, Any]:
@@ -372,12 +457,14 @@ class CiderAgentService:
         stopped = self._preferences.stop_active_session()
         if stopped is not None:
             self._clear_session_runtime(stopped["id"])
+            self._preferences.add_session_event(stopped["id"], event_type="session_stopped")
         return {"status": "ok", "result": self._rpc.playback_post("/stop")}
 
     def next_track(self) -> dict[str, Any]:
         session = self._preferences.get_active_session()
         if session is not None:
             self._set_session_runtime(session["id"], suspended=False)
+            self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
             return self._play_session_track(session, selection_strategy="adaptive-session-skip")
         return {"status": "ok", "result": self._rpc.playback_post("/next")}
 
@@ -750,6 +837,7 @@ class CiderAgentService:
         stopped = self._preferences.stop_active_session()
         if stopped is not None:
             self._clear_session_runtime(stopped["id"])
+            self._preferences.add_session_event(stopped["id"], event_type="session_stopped")
         return {"status": "ok", "stopped": stopped is not None, "session": stopped}
 
     def play_session(self, request: str) -> dict[str, Any]:
@@ -758,7 +846,13 @@ class CiderAgentService:
         session = self._preferences.start_session(request_text=request.strip())
         self._clear_all_session_runtime()
         self._set_session_runtime(session["id"], suspended=False)
-        result = self._play_session_track(session, selection_strategy="adaptive-session-start")
+        self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="starting")
+        self._preferences.add_session_event(session["id"], event_type="session_started", metadata={"request": request.strip()})
+        try:
+            result = self._play_session_track(session, selection_strategy="adaptive-session-start")
+        except Exception:
+            self._abort_failed_session_start(session["id"])
+            raise
         return {
             "status": "ok",
             "mode": "adaptive-session",
@@ -774,6 +868,8 @@ class CiderAgentService:
             raise CiderValidationError("No active session is running.")
         session = self._preferences.add_session_steering(session["id"], request.strip())
         self._set_session_runtime(session["id"], suspended=False)
+        self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
+        self._preferences.add_session_event(session["id"], event_type="session_steered", metadata={"request": request.strip()})
         result = self._play_session_track(session, selection_strategy="adaptive-session-steer")
         return {
             "status": "ok",
@@ -787,6 +883,8 @@ class CiderAgentService:
         if session is None:
             raise CiderValidationError("No active session is running.")
         self._set_session_runtime(session["id"], suspended=False)
+        self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
+        self._preferences.add_session_event(session["id"], event_type="session_manual_advance")
         result = self._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
         return {
             "status": "ok",
@@ -799,7 +897,23 @@ class CiderAgentService:
         session = self._preferences.get_active_session()
         if session is None:
             raise CiderValidationError("No active session is running.")
+        playback = self.playback_snapshot()
+        current = playback.get("track", {})
+        current_id = _clean_id(current.get("track_id"))
+        if current_id:
+            self._preferences.add_session_event(
+                session["id"],
+                event_type="track_rejected",
+                track={
+                    "track_id": current_id,
+                    "title": current.get("title"),
+                    "artist": current.get("artist"),
+                    "album": current.get("album"),
+                    "href": None,
+                },
+            )
         self._set_session_runtime(session["id"], suspended=False)
+        self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
         result = self._play_session_track(session, selection_strategy="adaptive-session-reject-current")
         return {
             "status": "ok",
@@ -868,187 +982,76 @@ class CiderAgentService:
     def resolve_text_request(self, text: str) -> ResolvedAction:
         return self._resolver.resolve(text, self)
 
-    def handle_text_request(self, text: str) -> dict[str, Any]:
+    def execute_text_request(self, text: str) -> TextRequestResult:
         started_at = time.perf_counter()
         resolve_started_at = time.perf_counter()
         resolved = self.resolve_text_request(text)
         resolve_ms = _elapsed_ms(resolve_started_at)
-        response = {
-            "status": "ok",
-            "input": text,
-            "resolver": resolved.resolver,
-            "resolved_action": self._compact_resolved_action(resolved.action, resolved.parameters),
-        }
-        if resolved.reasoning:
-            response["reasoning"] = resolved.reasoning
-        if resolved.raw_content:
-            response["resolver_raw_content"] = resolved.raw_content
-        if resolved.raw is not None and self._settings.resolver_include_raw_output:
-            response["resolver_raw_action"] = resolved.raw
+        resolved_action = self._compact_resolved_action(resolved.action, resolved.parameters)
         execute_started_at = time.perf_counter()
         try:
-            execution = self.run_action(resolved.action, resolved.parameters)
+            execution = self.execute_action(resolved.action, resolved.parameters)
         except CiderAgentError as exc:
-            response["status"] = "error"
-            response["error"] = {
-                "type": exc.__class__.__name__,
-                "message": str(exc),
-            }
+            error = {"type": exc.__class__.__name__, "message": str(exc)}
+            timings = None
             if self.include_timing_debug():
-                response["timings"] = {
+                timings = {
                     "resolve_ms": resolve_ms,
                     "execute_ms": _elapsed_ms(execute_started_at),
                     "total_ms": _elapsed_ms(started_at),
                 }
-            raise TextRequestExecutionError(str(exc), response) from exc
-        response["execution"] = execution
-        response["summary"] = self._summarize_execution(execution)
+            failure = TextRequestResult(
+                status="error",
+                input=text,
+                resolver=resolved.resolver,
+                resolved_action=resolved_action,
+                execution=EngineActionResult(action=resolved.action, result={}),
+                reasoning=resolved.reasoning,
+                resolver_raw_content=resolved.raw_content,
+                resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
+                timings=timings,
+                error=error,
+            )
+            raise TextRequestExecutionError(str(exc), failure.as_dict()) from exc
+        summary = self._summarize_execution(execution.as_dict())
+        timings = None
         if self.include_timing_debug():
             timings = {
                 "resolve_ms": resolve_ms,
                 "execute_ms": _elapsed_ms(execute_started_at),
                 "total_ms": _elapsed_ms(started_at),
             }
-            execution_timings = self._extract_execution_timings(execution)
+            execution_timings = self._extract_execution_timings(execution.as_dict())
             if isinstance(execution_timings, dict):
                 timings["execution"] = execution_timings
-            response["timings"] = timings
-        return response
+        return TextRequestResult(
+            input=text,
+            resolver=resolved.resolver,
+            resolved_action=resolved_action,
+            execution=execution,
+            summary=summary,
+            reasoning=resolved.reasoning,
+            resolver_raw_content=resolved.raw_content,
+            resolver_raw_action=resolved.raw if self._settings.resolver_include_raw_output else None,
+            timings=timings,
+        )
 
-    def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+    def handle_text_request(self, text: str) -> dict[str, Any]:
+        return self.execute_text_request(text).as_dict()
+
+    def execute_action(self, action: str, parameters: dict[str, Any] | None = None) -> EngineActionResult:
         params = parameters or {}
-        actions: dict[str, Any] = {
-            "status": self.status,
-            "get_now_playing": self.get_now_playing,
-            "playback_snapshot": self.playback_snapshot,
-            "is_playing": self.is_playing,
-            "play": self.play,
-            "pause": self.pause,
-            "playpause": self.playpause,
-            "stop": self.stop,
-            "next_track": self.next_track,
-            "previous_track": self.previous_track,
-            "seek": lambda: self.seek(float(params["position_seconds"])),
-            "get_volume": self.get_volume,
-            "set_volume": lambda: self.set_volume(self._coerce_volume_param(params)),
-            "get_repeat_mode": self.get_repeat_mode,
-            "toggle_repeat": self.toggle_repeat,
-            "get_shuffle_mode": self.get_shuffle_mode,
-            "toggle_shuffle": self.toggle_shuffle,
-            "get_autoplay": self.get_autoplay,
-            "toggle_autoplay": self.toggle_autoplay,
-            "get_queue": self.get_queue,
-            "play_next": lambda: self.play_next(dict(params["item"])),
-            "play_later": lambda: self.play_later(dict(params["item"])),
-            "move_queue_item": lambda: self.move_queue_item(int(params["from_index"]), int(params["to_index"])),
-            "remove_queue_item": lambda: self.remove_queue_item(int(params["index"])),
-            "clear_queue": self.clear_queue,
-            "play_url": lambda: self.play_url(str(params["url"])),
-            "play_item": lambda: self.play_item(
-                str(params["item_id"]),
-                kind=str(params.get("kind", "songs")),
-                is_library=bool(params.get("is_library", False)),
-            ),
-            "play_item_href": lambda: self.play_item_href(str(params["href"])),
-            "play_session": lambda: self.play_session(str(params["request"])),
-            "steer_session": lambda: self.steer_session(str(params["request"])),
-            "reject_current_track": self.reject_current_track,
-            "session_status": self.session_status,
-            "stop_session": self.stop_session,
-            "refill_session": self.refill_active_session,
-            "search_catalog": lambda: self.search_catalog(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-                storefront=str(params.get("storefront", "us")),
-            ),
-            "play_candidate_match": lambda: self.play_candidate_match(
-                candidate_tracks=list(params.get("candidate_tracks", [])) or None,
-                candidate_artists=list(params.get("candidate_artists", [])) or None,
-                candidate_queries=list(params.get("candidate_queries", params.get("candidate_query", []))) or None,
-                storefront=str(params.get("storefront", "us")),
-            ),
-            "search": lambda: self.search(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-                storefront=str(params.get("storefront", "us")),
-            ),
-            "search_catalog_tracks": lambda: self.search_catalog_tracks(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-                storefront=str(params.get("storefront", "us")),
-            ),
-            "search_library": lambda: self.search_library(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-                types=list(params.get("types", [])) or None,
-            ),
-            "search_library_tracks": lambda: self.search_library_tracks(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-            ),
-            "list_library_playlists": lambda: self.list_library_playlists(
-                limit=int(params.get("limit", 25)),
-                offset=int(params.get("offset", 0)),
-            ),
-            "search_library_playlists": lambda: self.search_library_playlists(
-                str(params["query"]),
-                limit=int(params.get("limit", 10)),
-            ),
-            "get_library_playlist": lambda: self.get_library_playlist(str(params["playlist_id"])),
-            "get_library_playlist_tracks": lambda: self.get_library_playlist_tracks(
-                str(params["playlist_id"]),
-                limit=int(params.get("limit", 100)),
-                offset=int(params.get("offset", 0)),
-            ),
-            "create_playlist": lambda: self.create_playlist(
-                name=str(params["name"]),
-                description=str(params["description"]) if params.get("description") is not None else None,
-                track_refs=list(params.get("track_refs", [])) or None,
-            ),
-            "add_playlist_tracks": lambda: self.add_playlist_tracks(
-                str(params["playlist_id"]),
-                track_refs=list(params["track_refs"]),
-            ),
-            "list_recently_played": lambda: self.list_recently_played(
-                limit=int(params.get("limit", 25)),
-                offset=int(params.get("offset", 0)),
-            ),
-            "play_search_result": lambda: self.play_search_result(
-                query=str(params["query"]),
-                source=str(params.get("source", "default")),
-                index=int(params.get("index", 0)),
-                storefront=str(params.get("storefront", "us")),
-            ),
-            "remember_preference": lambda: self.remember_preference(
-                kind=str(params["kind"]),
-                value=str(params["value"]),
-                category=str(params["category"]) if params.get("category") is not None else None,
-                weight=float(params.get("weight", 1.0)),
-                note=str(params["note"]) if params.get("note") is not None else None,
-            ),
-            "list_preferences": self.list_preferences,
-            "forget_preference": lambda: self.forget_preference(int(params["preference_id"])),
-            "recommend": lambda: self.recommend(
-                query=str(params["query"]) if params.get("query") is not None else None,
-                limit=int(params.get("limit", 5)),
-            ),
-            "play_recommendation": lambda: self.play_recommendation(
-                query=str(params["query"]) if params.get("query") is not None else None,
-            ),
-        }
-        if action not in actions:
+        definition = get_action_definition(action)
+        if definition is None:
             raise CiderValidationError(f"Unsupported action: {action}")
         try:
-            result = actions[action]()
+            result = definition.executor(self, params)
         except (KeyError, TypeError, ValueError) as exc:
             raise CiderValidationError(f"Invalid parameters for action {action}: {exc}") from exc
-        payload = {
-            "action": action,
-            "result": self._finalize_output(result),
-        }
-        if self.response_detail() == "debug":
-            payload["request_id"] = str(uuid.uuid4())
-        return payload
+        return EngineActionResult(action=action, result=self._finalize_output(result))
+
+    def run_action(self, action: str, parameters: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.execute_action(action, parameters).as_dict()
 
     def _session_worker_loop(self) -> None:
         while not self._session_worker_stop.wait(self.SESSION_REFILL_INTERVAL_SECONDS):
@@ -1067,13 +1070,13 @@ class CiderAgentService:
         with self._session_advance_lock:
             total_started_at = time.perf_counter()
             timings: dict[str, Any] = {}
-            now = time.monotonic()
             self._set_session_runtime(
                 session["id"],
                 suspended=False,
                 advance_in_progress=True,
-                last_advance_at=now,
+                last_advance_at=self.current_timestamp(),
             )
+            self._persist_session_runtime(session["id"], suspended=False, last_advance_at=self.current_timestamp())
             try:
                 playback_started_at = time.perf_counter()
                 playback = self.playback_snapshot()
@@ -1096,6 +1099,7 @@ class CiderAgentService:
                 timings["play_track_ms"] = _elapsed_ms(play_started_at)
                 record_selected_started_at = time.perf_counter()
                 self._preferences.add_session_track(session["id"], lead_track)
+                self._record_session_selection_event(session["id"], lead_track, selection_strategy=selection_strategy)
                 timings["record_selected_track_ms"] = _elapsed_ms(record_selected_started_at)
                 touch_started_at = time.perf_counter()
                 self._preferences.touch_session_refill(session["id"])
@@ -1104,9 +1108,17 @@ class CiderAgentService:
                     session["id"],
                     suspended=False,
                     advance_in_progress=False,
-                    last_advance_at=time.monotonic(),
+                    last_advance_at=self.current_timestamp(),
                     last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
+                    last_known_playback_state="playing",
                     planning_playback_snapshot=None,
+                )
+                self._persist_session_runtime(
+                    session["id"],
+                    suspended=False,
+                    last_advance_at=self.current_timestamp(),
+                    last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
+                    last_known_playback_state="playing",
                 )
                 result = {
                     "status": "ok",
@@ -1144,6 +1156,40 @@ class CiderAgentService:
             return str(session.get("request_text", "")).strip()
         return f"{session.get('request_text', '').strip()} Current steering: {steering_text}".strip()
 
+    def _session_candidate_artists(self, plan: SessionPlan) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        def add(artist_name: str) -> None:
+            key = artist_name.casefold()
+            if key in seen:
+                return
+            seen.add(key)
+            candidates.append(artist_name)
+
+        for artist in plan.candidate_artists:
+            artist_name = str(artist).strip()
+            if not artist_name:
+                continue
+            add(artist_name)
+        for track in plan.candidate_tracks:
+            artist_name = str(track.get("artist", "")).strip()
+            if not artist_name:
+                continue
+            add(artist_name)
+        return candidates
+
+    def _session_constraint_artist(self, session: dict[str, Any], plan: SessionPlan) -> str | None:
+        request_text = str(session.get("request_text", "")).strip()
+        return _extract_constraint_artist(request_text)
+
+    def _query_preserves_constraint_artist(self, query: str, artist: str | None) -> bool:
+        if not artist:
+            return True
+        query_norm = _normalize_match_text(query)
+        artist_norm = _normalize_match_text(artist)
+        return bool(query_norm and artist_norm and artist_norm in query_norm)
+
     def _collect_session_tracks(
         self,
         session: dict[str, Any],
@@ -1152,15 +1198,55 @@ class CiderAgentService:
         limit: int,
         timings: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        excluded_ids = self._session_excluded_track_ids(session)
+        constraint_artist = self._session_constraint_artist(session, plan)
+        excluded_ids = self._session_excluded_track_ids(session, include_global=True)
+        chosen = self._collect_session_tracks_with_exclusions(
+            plan,
+            limit=limit,
+            excluded_ids=excluded_ids,
+            constraint_artist=constraint_artist,
+        )
+
+        if not chosen and self.global_recent_tracks_limit() > 0:
+            relaxed_excluded_ids = self._session_excluded_track_ids(session, include_global=False)
+            chosen = self._collect_session_tracks_with_exclusions(
+                plan,
+                limit=limit,
+                excluded_ids=relaxed_excluded_ids,
+                constraint_artist=constraint_artist,
+            )
+            if timings is not None and self.include_timing_debug():
+                timings["relaxed_global_recent_exclusions"] = True
+                timings["excluded_track_count_after_relaxation"] = len(relaxed_excluded_ids)
+
+        if timings is not None and self.include_timing_debug():
+            timings["candidate_track_search_count"] = getattr(self, "_debug_candidate_track_search_count", 0)
+            timings["candidate_track_search_ms"] = round(getattr(self, "_debug_candidate_track_search_ms", 0.0), 2)
+            timings["candidate_artist_search_count"] = getattr(self, "_debug_candidate_artist_search_count", 0)
+            timings["candidate_artist_search_ms"] = round(getattr(self, "_debug_candidate_artist_search_ms", 0.0), 2)
+            timings["candidate_query_search_count"] = getattr(self, "_debug_candidate_query_search_count", 0)
+            timings["candidate_query_search_ms"] = round(getattr(self, "_debug_candidate_query_search_ms", 0.0), 2)
+            timings["excluded_track_count"] = len(excluded_ids)
+            timings["selected_track_count"] = len(chosen)
+
+        return chosen
+
+    def _collect_session_tracks_with_exclusions(
+        self,
+        plan: SessionPlan,
+        *,
+        limit: int,
+        excluded_ids: set[str],
+        constraint_artist: str | None,
+    ) -> list[dict[str, Any]]:
         chosen: list[dict[str, Any]] = []
         seen_ids = set(excluded_ids)
-        track_search_count = 0
-        track_search_ms = 0.0
-        artist_search_count = 0
-        artist_search_ms = 0.0
-        query_search_count = 0
-        query_search_ms = 0.0
+        self._debug_candidate_track_search_count = 0
+        self._debug_candidate_track_search_ms = 0.0
+        self._debug_candidate_artist_search_count = 0
+        self._debug_candidate_artist_search_ms = 0.0
+        self._debug_candidate_query_search_count = 0
+        self._debug_candidate_query_search_ms = 0.0
 
         for candidate in plan.candidate_tracks[: self.MAX_SESSION_TRACK_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
@@ -1171,8 +1257,8 @@ class CiderAgentService:
                 continue
             search_started_at = time.perf_counter()
             search = self.search_catalog_tracks(f"{artist} {title}", limit=10)
-            track_search_ms += _elapsed_ms(search_started_at)
-            track_search_count += 1
+            self._debug_candidate_track_search_ms += _elapsed_ms(search_started_at)
+            self._debug_candidate_track_search_count += 1
             match = self._best_track_match(search["tracks"], title=title, artist=artist)
             if match is None:
                 continue
@@ -1183,13 +1269,13 @@ class CiderAgentService:
             if match_id:
                 seen_ids.add(match_id)
 
-        for artist in plan.candidate_artists[: self.MAX_SESSION_ARTIST_SEARCH_CANDIDATES]:
+        for artist in self._session_candidate_artists(plan)[: self.MAX_SESSION_ARTIST_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
                 break
             search_started_at = time.perf_counter()
             search = self.search_catalog_tracks(str(artist), limit=15)
-            artist_search_ms += _elapsed_ms(search_started_at)
-            artist_search_count += 1
+            self._debug_candidate_artist_search_ms += _elapsed_ms(search_started_at)
+            self._debug_candidate_artist_search_count += 1
             for match in self._best_artist_track_matches(search["tracks"], artist=str(artist), limit=limit - len(chosen)):
                 match_id = str(match.get("id", "")).strip()
                 if match_id and match_id in seen_ids:
@@ -1203,10 +1289,12 @@ class CiderAgentService:
         for query in plan.candidate_queries[: self.MAX_SESSION_QUERY_SEARCH_CANDIDATES]:
             if len(chosen) >= limit:
                 break
+            if not self._query_preserves_constraint_artist(str(query), constraint_artist):
+                continue
             search_started_at = time.perf_counter()
             results = self.search(str(query), limit=25)
-            query_search_ms += _elapsed_ms(search_started_at)
-            query_search_count += 1
+            self._debug_candidate_query_search_ms += _elapsed_ms(search_started_at)
+            self._debug_candidate_query_search_count += 1
             for track in self._top_pool_order(list(results.get("tracks", [])), take=limit - len(chosen)):
                 match_id = str(track.get("id", "")).strip()
                 if match_id and match_id in seen_ids:
@@ -1217,36 +1305,37 @@ class CiderAgentService:
                 if len(chosen) >= limit:
                     break
 
-        if timings is not None and self.include_timing_debug():
-            timings["candidate_track_search_count"] = track_search_count
-            timings["candidate_track_search_ms"] = round(track_search_ms, 2)
-            timings["candidate_artist_search_count"] = artist_search_count
-            timings["candidate_artist_search_ms"] = round(artist_search_ms, 2)
-            timings["candidate_query_search_count"] = query_search_count
-            timings["candidate_query_search_ms"] = round(query_search_ms, 2)
-            timings["excluded_track_count"] = len(excluded_ids)
-            timings["selected_track_count"] = len(chosen)
-
         return chosen
 
-    def _session_excluded_track_ids(self, session: dict[str, Any]) -> set[str]:
+    def _session_excluded_track_ids(self, session: dict[str, Any], *, include_global: bool = True) -> set[str]:
         excluded: set[str] = set()
         playback = self.session_planning_playback_snapshot(session)
         current = playback.get("track", {})
         current_id = _clean_id(current.get("track_id"))
         if current_id:
             excluded.add(current_id)
-        for track in self.recent_session_tracks(limit=self.session_recent_tracks_limit()):
-            track_id = _clean_id(track.get("track_id"))
+        for event in self._preferences.list_session_events(
+            session["id"],
+            limit=self.session_recent_tracks_limit(),
+            event_types=["track_selected", "track_started", "track_auto_advanced"],
+        ):
+            track_id = _clean_id(event.get("track_id"))
             if track_id:
                 excluded.add(track_id)
-        for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
-            track_id = _clean_id(track.get("track_id"))
-            if track_id:
-                excluded.add(track_id)
+        if include_global:
+            for track in self.recent_global_tracks(limit=self.global_recent_tracks_limit()):
+                track_id = _clean_id(track.get("track_id"))
+                if track_id:
+                    excluded.add(track_id)
         return excluded
 
-    def _record_current_track_for_session(self, session: dict[str, Any], *, playback: dict[str, Any] | None = None) -> None:
+    def _record_current_track_for_session(
+        self,
+        session: dict[str, Any],
+        *,
+        playback: dict[str, Any] | None = None,
+        event_type: str = "track_started",
+    ) -> None:
         current = (playback or self.playback_snapshot()).get("track", {})
         current_id = _clean_id(current.get("track_id"))
         if not current_id:
@@ -1264,6 +1353,17 @@ class CiderAgentService:
                 "href": None,
             },
         )
+        self._preferences.add_session_event(
+            session["id"],
+            event_type=event_type,
+            track={
+                "track_id": current_id,
+                "title": current.get("title"),
+                "artist": current.get("artist"),
+                "album": current.get("album"),
+                "href": None,
+            },
+        )
 
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
         runtime = self._get_session_runtime(session["id"])
@@ -1273,9 +1373,8 @@ class CiderAgentService:
             return False
         if playback.get("is_playing"):
             return False
-        now = time.monotonic()
-        last_advance_at = runtime.get("last_advance_at", 0.0)
-        if now - float(last_advance_at) < self.SESSION_ADVANCE_COOLDOWN_SECONDS:
+        elapsed = self._seconds_since_runtime_timestamp(runtime.get("last_advance_at"))
+        if elapsed is not None and elapsed < self.SESSION_ADVANCE_COOLDOWN_SECONDS:
             return False
         return True
 
@@ -1292,10 +1391,71 @@ class CiderAgentService:
     def _clear_session_runtime(self, session_id: int) -> None:
         with self._session_runtime_lock:
             self._session_runtime.pop(session_id, None)
+        self._preferences.clear_session_runtime(session_id)
 
     def _clear_all_session_runtime(self) -> None:
         with self._session_runtime_lock:
             self._session_runtime.clear()
+
+    def _abort_failed_session_start(self, session_id: int) -> None:
+        active = self._preferences.get_active_session()
+        if active is not None and int(active["id"]) == int(session_id):
+            self._preferences.stop_active_session()
+        self._clear_session_runtime(session_id)
+
+    def _persist_session_runtime(
+        self,
+        session_id: int,
+        *,
+        suspended: bool | None = None,
+        last_advance_at: str | None = None,
+        last_selected_track_id: str | None = None,
+        last_known_playback_state: str | None = None,
+        preserve_last_advance: bool = False,
+    ) -> None:
+        runtime = self._preferences.get_session_runtime(session_id)
+        resolved_last_advance_at = runtime.get("last_advance_at") if runtime and preserve_last_advance else last_advance_at
+        self._preferences.upsert_session_runtime(
+            session_id,
+            active_intent="suspended" if suspended else "active",
+            last_advance_at=resolved_last_advance_at,
+            last_selected_track_id=last_selected_track_id,
+            last_known_playback_state=last_known_playback_state,
+        )
+
+    def _seconds_since_runtime_timestamp(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return time.monotonic() - float(value)
+        if isinstance(value, str):
+            try:
+                then = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            return (datetime.now().astimezone() - then.astimezone()).total_seconds()
+        return None
+
+    def _record_session_selection_event(self, session_id: int, track: dict[str, Any], *, selection_strategy: str) -> None:
+        event_type = "track_selected"
+        if selection_strategy == "adaptive-session-auto-advance":
+            event_type = "track_auto_advanced"
+        elif selection_strategy == "adaptive-session-skip":
+            event_type = "track_manual_skip"
+        elif selection_strategy == "adaptive-session-steer":
+            event_type = "track_manually_steered"
+        self._preferences.add_session_event(
+            session_id,
+            event_type=event_type,
+            track={
+                "track_id": _clean_id(track.get("play_params", {}).get("id")) or _clean_id(track.get("id")),
+                "title": track.get("title"),
+                "artist": track.get("artist"),
+                "album": track.get("album"),
+                "href": track.get("href"),
+            },
+            metadata={"selection_strategy": selection_strategy},
+        )
 
     def _extract_is_playing(self, payload: Any) -> bool | None:
         if isinstance(payload, bool):
@@ -1359,6 +1519,7 @@ class CiderAgentService:
 
     def _best_track_match(self, tracks: list[dict[str, Any]], *, title: str, artist: str) -> dict[str, Any] | None:
         title_norm = _normalize_match_text(title)
+        title_base_norm = _normalize_title_match_text(title)
         artist_norm = _normalize_match_text(artist)
         for track in tracks:
             if _normalize_match_text(track.get("title")) == title_norm and _normalize_match_text(track.get("artist")) == artist_norm:
@@ -1368,6 +1529,21 @@ class CiderAgentService:
             track_artist = _normalize_match_text(track.get("artist"))
             if title_norm in track_title and artist_norm == track_artist:
                 return track
+        if title_base_norm:
+            for track in tracks:
+                track_title_base = _normalize_title_match_text(track.get("title"))
+                track_artist = _normalize_match_text(track.get("artist"))
+                if track_artist != artist_norm:
+                    continue
+                if track_title_base == title_base_norm:
+                    return track
+            for track in tracks:
+                track_title_base = _normalize_title_match_text(track.get("title"))
+                track_artist = _normalize_match_text(track.get("artist"))
+                if track_artist != artist_norm:
+                    continue
+                if title_base_norm in track_title_base or track_title_base in title_base_norm:
+                    return track
         return None
 
     def _best_artist_track_match(self, tracks: list[dict[str, Any]], *, artist: str) -> dict[str, Any] | None:

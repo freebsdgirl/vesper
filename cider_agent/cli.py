@@ -13,6 +13,7 @@ import httpx
 from .a2a import _message
 from .app import get_service, get_settings
 from .errors import CiderAgentError, TextRequestExecutionError
+from .renderers import render_task_payload_for_cli
 
 
 def _print_payload(payload: dict[str, Any], as_json: bool) -> None:
@@ -53,27 +54,6 @@ def _post_local_a2a(*, method: str, params: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _extract_data_part(parts: Any) -> dict[str, Any] | None:
-    if not isinstance(parts, list):
-        return None
-    for part in parts:
-        if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
-            return dict(part["data"])
-    return None
-
-
-def _extract_task_payload(task: dict[str, Any]) -> dict[str, Any]:
-    artifacts = task.get("artifacts", [])
-    if isinstance(artifacts, list):
-        for artifact in artifacts:
-            if not isinstance(artifact, dict):
-                continue
-            payload = _extract_data_part(artifact.get("parts", []))
-            if payload is not None:
-                return payload
-    raise CiderAgentError("Local A2A server task did not include a data artifact.")
-
-
 def _raise_for_failed_task(task: dict[str, Any]) -> None:
     status = task.get("status", {})
     message = "Local A2A server task failed."
@@ -81,7 +61,13 @@ def _raise_for_failed_task(task: dict[str, Any]) -> None:
     if isinstance(status, dict):
         status_message = status.get("message")
         if isinstance(status_message, dict):
-            payload = _extract_data_part(status_message.get("parts", []))
+            payload = None
+            parts = status_message.get("parts", [])
+            if isinstance(parts, list):
+                for part in parts:
+                    if isinstance(part, dict) and part.get("kind") == "data" and isinstance(part.get("data"), dict):
+                        payload = dict(part["data"])
+                        break
             parts = status_message.get("parts", [])
             if isinstance(parts, list):
                 for part in parts:
@@ -104,28 +90,10 @@ def _call_local_a2a(message: dict[str, Any]) -> dict[str, Any]:
 
 
 def _task_to_cli_payload(task: dict[str, Any], *, original_text: str | None = None) -> dict[str, Any]:
-    payload = _extract_task_payload(task)
-    metadata = task.get("metadata", {}) if isinstance(task.get("metadata"), dict) else {}
-    action = metadata.get("action")
-    if original_text is not None:
-        response: dict[str, Any] = {
-            "status": "ok",
-            "input": original_text,
-            "resolver": metadata.get("resolver"),
-            "resolved_action": metadata.get("resolved_action", {"action": action} if action else {}),
-            "execution": {
-                "action": action,
-                "result": payload,
-            },
-        }
-        if "reasoning" in metadata:
-            response["reasoning"] = metadata["reasoning"]
-        if "resolver_raw_content" in metadata:
-            response["resolver_raw_content"] = metadata["resolver_raw_content"]
-        if "resolver_raw_action" in metadata:
-            response["resolver_raw_action"] = metadata["resolver_raw_action"]
-        return response
-    return payload
+    try:
+        return render_task_payload_for_cli(task, original_text=original_text)
+    except ValueError as exc:
+        raise CiderAgentError("Local A2A server task did not include a data artifact.") from exc
 
 
 def _build_action_request(args: argparse.Namespace) -> tuple[str, dict[str, Any]] | None:
