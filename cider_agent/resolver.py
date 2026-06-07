@@ -132,6 +132,13 @@ class OpenAICompatibleResolver:
         candidate_tracks = self._normalize_candidate_tracks(parsed.get("candidate_tracks"))
         candidate_artists = self._normalize_candidate_artists(parsed.get("candidate_artists"))
         candidate_queries = self._normalize_candidate_queries(parsed.get("candidate_queries"))
+        artist_seed = self._extract_artist_seed(request)
+        if artist_seed and artist_seed not in candidate_artists:
+            candidate_artists = [artist_seed, *candidate_artists]
+        if artist_seed and not self._request_mentions_specific_track(request):
+            candidate_tracks = []
+        if artist_seed and not candidate_queries:
+            candidate_queries = [artist_seed]
         if not candidate_queries:
             synthesized = self._fallback_query_from_text(request)
             if synthesized:
@@ -183,6 +190,7 @@ class OpenAICompatibleResolver:
                 "play_candidate_match",
                 "play_session",
                 "steer_session",
+                "reject_current_track",
                 "session_status",
                 "stop_session",
                 "play_search_result",
@@ -200,10 +208,12 @@ class OpenAICompatibleResolver:
                 "If the user asks for a vibe, era, popularity, activity, time-of-day, or descriptive request, prefer play_session.",
                 "If the user asks for something by an artist without naming a specific track, prefer play_session.",
                 "If there is an active session and the user asks for a change like 'more pop' or 'more of this artist', prefer steer_session.",
+                "If there is an active session and the user says things like 'I don't like this', 'skip this', 'not this one', or otherwise rejects only the current track, prefer reject_current_track instead of changing the whole session vibe.",
                 "For play_candidate_match, provide candidate_tracks as [{'title': ..., 'artist': ...}] when possible.",
                 "For play_candidate_match, provide candidate_artists only as fallback support.",
                 "For play_candidate_match, always include candidate_queries for descriptive requests as last-resort fallback search phrases.",
                 "Do not invent fake artists or track titles. Prefer real, attributable music. If uncertain, rely more on candidate_queries.",
+                "If the user names an artist but not a specific song, do not guess a current track from memory. Prefer artist-driven live catalog selection via play_session or candidate_artists.",
                 "Bad fallback query example: 'popular songs by Pink'. Better candidate artist: 'P!nk'. Better candidate tracks might be her known singles.",
                 "If the user asks what is playing, use get_now_playing.",
                 "If the user asks to resume, use play. If the user asks to pause, use pause.",
@@ -216,6 +226,7 @@ class OpenAICompatibleResolver:
             "Do not explain your reasoning. "
             "Prefer direct execution actions over informational searches when the user clearly asked to play or pause something. "
             "Treat generic or descriptive play requests as adaptive long-form listening sessions. "
+            "When a user gives negative feedback about only the currently playing song, reject just that track rather than changing the whole session. "
             "For descriptive playback requests, propose concrete track and artist candidates rather than a literal English search phrase. "
             "Never invent obviously fake artist or song names; if you are unsure, include candidate_queries fallback phrases."
         )
@@ -242,6 +253,7 @@ class OpenAICompatibleResolver:
             "Avoid repeating tracks from recent_tracks unless truly necessary. "
             "Honor the original session_request, steering changes, and the current timestamp. "
             "If the request is generic, you may adapt to time of day, such as higher energy in the morning and calmer music late at night. "
+            "If the request names an artist but not a specific song, prefer candidate_artists and let the service retrieve live catalog tracks rather than guessing exact songs from memory. "
             "Always include at least one candidate_queries fallback phrase."
         )
         return [
@@ -371,6 +383,34 @@ class OpenAICompatibleResolver:
             subject = re.sub(r"^make me\s+", "", subject, flags=re.IGNORECASE)
             return f"{subject} music".strip() if subject else cleaned
         return cleaned
+
+    def _extract_artist_seed(self, text: str) -> str | None:
+        patterns = [
+            r"^\s*play\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
+            r"^\s*more\s+of\s+(.+?)\s*$",
+            r"^\s*add\s+(?:some|something\s+by|music\s+by)\s+(.+?)\s*$",
+        ]
+        for pattern in patterns:
+            match = re.match(pattern, text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = match.group(1).strip(" .,:;!?\"'")
+            candidate = re.sub(r"\s+(please|for me)$", "", candidate, flags=re.IGNORECASE).strip()
+            if candidate and not self._request_mentions_specific_track(text):
+                return candidate
+        return None
+
+    def _request_mentions_specific_track(self, text: str) -> bool:
+        lowered = text.casefold()
+        markers = [
+            "song ",
+            "track ",
+            "called ",
+            "named ",
+            " titled ",
+            " title ",
+        ]
+        return any(marker in lowered for marker in markers)
 
     def _normalize_candidate_tracks(self, value: Any) -> list[dict[str, str]]:
         if not isinstance(value, list):

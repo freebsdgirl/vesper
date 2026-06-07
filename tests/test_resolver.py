@@ -153,6 +153,54 @@ def test_openai_compatible_resolver_includes_reasoning_when_enabled(settings: Se
     assert resolved.reasoning == "I mapped the request to a simple status action."
 
 
+def test_openai_compatible_resolver_can_reject_current_track(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class RejectTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "reject_current_track",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=RejectTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolved = resolver.resolve("i don't like this", service)
+
+    assert resolved.action == "reject_current_track"
+    assert resolved.parameters == {}
+
+
 def test_candidate_match_parameters_are_normalized(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,
@@ -351,3 +399,53 @@ def test_openai_compatible_resolver_includes_raw_output_when_enabled(settings: S
 
     assert resolved.raw_content == raw_content
     assert resolved.raw == {"action": "status", "parameters": {}}
+
+
+def test_session_plan_prefers_live_artist_selection_for_artist_request(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class ArtistSessionTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "candidate_tracks": [{"title": "Old Training Data Song", "artist": "KATSEYE"}],
+                                    "candidate_artists": [],
+                                    "candidate_queries": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=ArtistSessionTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    plan = resolver.plan_session("play some KATSEYE", service, {"request_text": "play some KATSEYE"}, 3)
+
+    assert plan.candidate_tracks == []
+    assert plan.candidate_artists[0] == "KATSEYE"
+    assert plan.candidate_queries == ["KATSEYE"]

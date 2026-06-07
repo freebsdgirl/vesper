@@ -155,6 +155,16 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     assert result["tracks"][0]["title"] == "Another Song"
 
 
+def test_reject_current_track_advances_active_session_without_changing_vibe(service) -> None:
+    service.play_session("play upbeat music")
+
+    result = service.reject_current_track()
+
+    assert result["status"] == "ok"
+    assert result["result"]["selection_strategy"] == "adaptive-session-reject-current"
+    assert result["result"]["tracks"][0]["title"] == "Another Song"
+
+
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
     class RawStubResolver:
         def resolve(self, text: str, service) -> ResolvedAction:

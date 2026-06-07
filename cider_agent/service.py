@@ -767,6 +767,19 @@ class CiderAgentService:
             "result": result,
         }
 
+    def reject_current_track(self) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is None:
+            raise CiderValidationError("No active session is running.")
+        self._set_session_runtime(session["id"], suspended=False)
+        result = self._play_session_track(session, selection_strategy="adaptive-session-reject-current")
+        return {
+            "status": "ok",
+            "mode": "adaptive-session",
+            "session": self._preferences.get_session(session["id"]),
+            "result": result,
+        }
+
     def play_candidate_match(
         self,
         *,
@@ -890,6 +903,7 @@ class CiderAgentService:
             "play_item_href": lambda: self.play_item_href(str(params["href"])),
             "play_session": lambda: self.play_session(str(params["request"])),
             "steer_session": lambda: self.steer_session(str(params["request"])),
+            "reject_current_track": self.reject_current_track,
             "session_status": self.session_status,
             "stop_session": self.stop_session,
             "refill_session": self.refill_active_session,
