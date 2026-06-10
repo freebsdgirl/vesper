@@ -182,6 +182,53 @@ Common structured actions:
 - `remember_preference`, `list_preferences`, `forget_preference`
 - `recommend`, `play_recommendation`
 
+Implementation status:
+
+| Action | Status | Notes |
+| --- | --- | --- |
+| `status` | implemented, tested | Service summary view with compact queue/session details. |
+| `get_now_playing` | implemented | Direct Cider RPC wrapper over `/now-playing`. |
+| `play` | implemented | Resumes native playback, or resumes an adaptive session if one is active. |
+| `pause` | implemented | Pauses playback and marks an active adaptive session as suspended. |
+| `playpause` | implemented | Thin RPC wrapper over `/playpause`. |
+| `stop` | implemented | Stops playback and clears any active adaptive session. |
+| `next_track` | implemented, tested | Skips natively when no session is active; otherwise advances the adaptive session immediately. |
+| `previous_track` | implemented | Thin RPC wrapper over `/previous`. |
+| `play_session` | implemented, tested | Starts an adaptive session and immediately resolves a playable track. |
+| `steer_session` | implemented, tested, deferred | Updates active session intent/query pools, but does not switch tracks immediately. The change takes effect on the next selection step. |
+| `reject_current_track` | implemented, tested | Rejects the current adaptive-session track and immediately advances without changing the overall vibe. |
+| `session_status` | implemented, tested | Reports active session state and recent session tracks. |
+| `stop_session` | implemented | Stops the active adaptive session without requiring a global playback stop. |
+| `refill_session` | implemented | Manually advances the active adaptive session. |
+| `seek` | implemented | Validated RPC wrapper over `/seek`. |
+| `set_volume` | implemented, tested | Normalizes user-friendly volume input to Cider’s `0.0-1.0` format. |
+| `get_queue` | implemented | Reads the current native queue and flattens track metadata. |
+| `move_queue_item` | implemented | Validated RPC wrapper over `/queue/move-to-position`. |
+| `remove_queue_item` | implemented | Validated RPC wrapper over `/queue/remove-by-index`. |
+| `clear_queue` | implemented | Thin RPC wrapper over `/queue/clear-queue`. |
+| `search` | implemented, tested | Dispatches to the configured default search source. |
+| `search_catalog` | implemented | Catalog search over Apple Music. |
+| `search_catalog_tracks` | implemented | Alias of `search_catalog`. |
+| `search_library` | implemented | Library search across songs, albums, artists, and playlists. |
+| `search_library_tracks` | implemented, tested | Library-song-only search. |
+| `list_library_playlists` | implemented | Read-only playlist listing through `run-v3`. |
+| `search_library_playlists` | implemented | Read-only playlist search through `run-v3`. |
+| `get_library_playlist` | implemented | Reads one library playlist by id. |
+| `get_library_playlist_tracks` | implemented | Reads tracks for one library playlist. |
+| `list_recently_played` | implemented | Read-only recently-played track listing. |
+| `remember_preference` | implemented, tested | Persists explicit likes/dislikes in local storage. |
+| `list_preferences` | implemented, tested | Lists stored preferences from local storage. |
+| `forget_preference` | implemented | Deletes one stored preference by id. |
+| `recommend` | implemented, tested | Generates recommendations from stored preferences. |
+| `play_recommendation` | implemented | Plays the top recommendation immediately. |
+
+Removed actions:
+
+| Action | Status | Notes |
+| --- | --- | --- |
+| `create_playlist` | removed | This was intentionally deleted instead of left as a failing stub because current Cider builds do not expose a reliable playlist mutation path. |
+| `add_playlist_tracks` | removed | Same reason as `create_playlist`; the mutation surface was dead and misleading. |
+
 ## Architecture
 
 `cider_agent` is built around a transport-agnostic service layer. The CLI and A2A server are thin adapters over the same core engine, so future transports such as MCP or a local web UI can reuse the same playback, search, and session logic.
