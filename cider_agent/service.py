@@ -1980,6 +1980,8 @@ class CiderAgentService:
                 handle.write(entry)
 
     def _should_advance_session(self, session: dict[str, Any], playback: dict[str, Any]) -> bool:
+        # This coordinates long-lived processes through persisted runtime, but
+        # intentionally does not provide an atomic cross-process worker lease.
         runtime = self._effective_session_runtime(session["id"])
         if runtime.get("suspended"):
             return False
@@ -1994,14 +1996,12 @@ class CiderAgentService:
 
     def _effective_session_runtime(self, session_id: int) -> dict[str, Any]:
         runtime = self._get_session_runtime(session_id)
-        # Session control can be split across processes. If this process has no
-        # in-memory runtime for the active session yet, fall back to the
-        # persisted session_runtime row so cooldown and suspended state still
-        # prevent a duplicate advance.
+        # Session control can be split across long-lived processes. Persisted
+        # control state must override stale in-memory values from this process.
         stored = self._preferences.get_session_runtime(session_id) or {}
-        if "suspended" not in runtime and stored:
+        if stored:
             runtime["suspended"] = stored.get("active_intent") == "suspended"
-        if "last_advance_at" not in runtime and stored.get("last_advance_at") is not None:
+        if stored.get("last_advance_at") is not None:
             runtime["last_advance_at"] = stored.get("last_advance_at")
         if "last_selected_track_id" not in runtime and stored.get("last_selected_track_id") is not None:
             runtime["last_selected_track_id"] = stored.get("last_selected_track_id")

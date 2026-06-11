@@ -409,6 +409,7 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
     service._rpc.is_playing = False
     service._rpc.current_track = None
     service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     assert service._should_advance_session(session, service.playback_snapshot()) is True
 
@@ -448,20 +449,71 @@ def test_session_worker_respects_persisted_cooldown_across_processes(settings, s
         preference_store=PreferenceStore(database_path),
         resolver=service._resolver.__class__(),
     )
+    first.play_session("play upbeat music")
     second = CiderAgentService(
         first._settings,
         rpc_client=rpc,
         preference_store=PreferenceStore(database_path),
         resolver=first._resolver,
     )
+    session = second._preferences.get_active_session()
+    assert session is not None
 
-    first.play_session("play upbeat music")
+    second._set_session_runtime(session["id"], last_advance_at=0.0)
+    first.next_track()
     rpc.is_playing = False
     rpc.current_track = None
 
+    assert second._get_session_runtime(session["id"])["last_advance_at"] == 0.0
+    assert second._should_advance_session(session, second.playback_snapshot()) is False
+
+
+def test_session_worker_respects_persisted_suspension_across_long_lived_processes(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "cross-process-suspension.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    second = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
     session = second._preferences.get_active_session()
     assert session is not None
-    assert second._get_session_runtime(session["id"]) == {}
+
+    first.pause()
+    second._set_session_runtime(session["id"], suspended=False, last_advance_at=0.0)
+    rpc.is_playing = False
+    rpc.current_track = None
+
+    assert second._get_session_runtime(session["id"])["suspended"] is False
     assert second._should_advance_session(session, second.playback_snapshot()) is False
 
 
@@ -1912,6 +1964,7 @@ def test_active_stopped_session_can_continue_after_restart(settings, service, tm
     assert session is not None
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
     restarted._set_session_runtime(session["id"], last_advance_at=0.0)
+    restarted._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
     assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
 
 
