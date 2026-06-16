@@ -98,6 +98,7 @@ cider-agent serve
 Published endpoints:
 
 - `POST /a2a`
+- `GET /.well-known/agent-card`
 - `GET /.well-known/agent-card.json`
 - `POST /message:send`
 - `POST /message:stream`

@@ -388,9 +388,7 @@ class OpenAICompatibleResolver:
         payload = {
             "model": self._settings.resolver_model,
             "messages": messages,
-            "think": False,
-            "reasoning_effort": "none",
-            "reasoning": {"effort": "none"},
+            **self._reasoning_request_options(),
         }
         try:
             response = self._session.post("/chat/completions", headers=headers, json=payload)
@@ -409,6 +407,15 @@ class OpenAICompatibleResolver:
         except ValueError as exc:
             raise ResolverError("Resolver endpoint returned non-JSON output.") from exc
         return body, self._extract_content(body)
+
+    def _reasoning_request_options(self) -> dict[str, Any]:
+        include_reasoning = self._settings.resolver_include_reasoning
+        effort = "medium" if include_reasoning else "none"
+        return {
+            "think": include_reasoning,
+            "reasoning_effort": effort,
+            "reasoning": {"effort": effort},
+        }
 
     def _complete_parsed_json(
         self, messages: list[dict[str, str]], headers: dict[str, str]

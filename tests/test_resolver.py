@@ -208,6 +208,60 @@ def test_openai_compatible_resolver_sends_no_think_ollama_fields(settings: Setti
     assert body["reasoning"] == {"effort": "none"}
 
 
+def test_openai_compatible_resolver_enables_reasoning_fields_when_configured(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=True,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    captured: dict[str, object] = {}
+
+    class CaptureTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            captured["body"] = json.loads(request.content.decode("utf-8"))
+            body = {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "action": "status",
+                                    "parameters": {},
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=CaptureTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    resolver.resolve("play some kep1er", service)
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["think"] is True
+    assert body["reasoning_effort"] == "medium"
+    assert body["reasoning"] == {"effort": "medium"}
+
+
 def test_openai_compatible_resolver_uses_compact_allowed_action_list(settings: Settings, service) -> None:
     resolver_settings = Settings(
         http_host=settings.http_host,

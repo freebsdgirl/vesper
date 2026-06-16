@@ -82,6 +82,19 @@ def test_agent_card_is_published(monkeypatch, service, settings) -> None:
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["name"] == "cider"
+    assert payload["supportedInterfaces"][0]["protocolVersion"] == "1.0"
+    assert payload["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8766/a2a"
+    assert payload["supportedInterfaces"][0]["protocolBinding"] == "JSONRPC"
+    assert payload["skills"][0]["inputModes"] == ["text/plain"]
+
+
+def test_agent_card_alias_is_published(monkeypatch, service, settings) -> None:
+    response = asyncio.run(_request(_app(monkeypatch, service, settings), "GET", "/.well-known/agent-card"))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["name"] == "cider"
     assert payload["supportedInterfaces"][0]["protocolVersion"] == "1.0"
     assert payload["supportedInterfaces"][0]["url"] == "http://127.0.0.1:8766/a2a"
     assert payload["supportedInterfaces"][0]["protocolBinding"] == "JSONRPC"

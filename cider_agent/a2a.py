@@ -113,7 +113,7 @@ class ExecutionResult:
 def build_agent_card() -> AgentCard:
     settings = get_settings()
     return AgentCard(
-        name="Cider Agent",
+        name="cider",
         description="A dedicated music control agent for Cider. The intended interface is plain-language requests over A2A text messages.",
         version="0.1.0",
         supported_interfaces=[
@@ -400,6 +400,10 @@ def create_a2a_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/.well-known/agent-card", response_model=None)
+    async def agent_card_alias() -> dict[str, Any]:
+        return MessageToDict(build_agent_card(), preserving_proto_field_name=False)
 
     handler = DefaultRequestHandlerV2(
         agent_executor=CiderAgentExecutor(),
