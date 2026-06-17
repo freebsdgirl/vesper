@@ -20,7 +20,6 @@ dev = [
 
 [project.scripts]
 cider-agent = "cider_agent.cli:main"
-cider-agent-serve = "cider_agent.a2a:main"
 
 [build-system]
 requires = ["hatchling"]

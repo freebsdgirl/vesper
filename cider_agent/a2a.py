@@ -1,4 +1,4 @@
-"""A2A transport built on top of ``a2a-sdk``."""
+"""HTTP transport hosting for cider_agent."""
 
 from __future__ import annotations
 
@@ -403,7 +403,10 @@ def _create_lifespan(mcp_session_manager=None):
     return _lifespan
 
 
-def create_a2a_app(*, include_mcp: bool = False) -> FastAPI:
+def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> FastAPI:
+    if not include_a2a and not include_mcp:
+        raise ValueError("At least one HTTP transport must be enabled.")
+
     mcp_server = None
     mcp_endpoint = None
     if include_mcp:
@@ -417,37 +420,51 @@ def create_a2a_app(*, include_mcp: bool = False) -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.get("/.well-known/agent-card", response_model=None)
-    async def agent_card_alias() -> dict[str, Any]:
-        return MessageToDict(build_agent_card(), preserving_proto_field_name=False)
+    if include_a2a:
+        @app.get("/.well-known/agent-card", response_model=None)
+        async def agent_card_alias() -> dict[str, Any]:
+            return MessageToDict(build_agent_card(), preserving_proto_field_name=False)
 
-    handler = DefaultRequestHandlerV2(
-        agent_executor=CiderAgentExecutor(),
-        task_store=InMemoryTaskStore(),
-        agent_card=build_agent_card(),
-    )
-    add_a2a_routes_to_fastapi(
-        app,
-        agent_card_routes=create_agent_card_routes(build_agent_card(), card_url=AGENT_CARD_WELL_KNOWN_PATH),
-        jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
-        rest_routes=create_rest_routes(handler),
-    )
+        handler = DefaultRequestHandlerV2(
+            agent_executor=CiderAgentExecutor(),
+            task_store=InMemoryTaskStore(),
+            agent_card=build_agent_card(),
+        )
+        add_a2a_routes_to_fastapi(
+            app,
+            agent_card_routes=create_agent_card_routes(build_agent_card(), card_url=AGENT_CARD_WELL_KNOWN_PATH),
+            jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
+            rest_routes=create_rest_routes(handler),
+        )
+
     if mcp_endpoint is not None:
         app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint))
         app.router.routes.append(Route("/mcp/", endpoint=mcp_endpoint))
     return app
 
 
-def run_server(*, include_mcp: bool = False) -> None:
+def create_a2a_app(*, include_mcp: bool = False) -> FastAPI:
+    return create_http_app(include_a2a=True, include_mcp=include_mcp)
+
+
+def run_server(*, include_a2a: bool = False, include_mcp: bool = False) -> None:
     settings = get_settings()
-    uvicorn.run(create_a2a_app(include_mcp=include_mcp), host=settings.http_host, port=settings.http_port, reload=False)
+    uvicorn.run(
+        create_http_app(include_a2a=include_a2a, include_mcp=include_mcp),
+        host=settings.http_host,
+        port=settings.http_port,
+        reload=False,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the cider_agent A2A server.")
+    parser = argparse.ArgumentParser(description="Run the cider_agent HTTP transports.")
+    parser.add_argument("--a2a", action="store_true", help="Enable the A2A HTTP transport.")
     parser.add_argument("--mcp", action="store_true", help="Also mount the MCP Streamable HTTP transport at /mcp.")
     args = parser.parse_args()
-    run_server(include_mcp=args.mcp)
+    if not args.a2a and not args.mcp:
+        parser.error("At least one transport flag is required: --a2a and/or --mcp.")
+    run_server(include_a2a=args.a2a, include_mcp=args.mcp)
 
 
 if __name__ == "__main__":

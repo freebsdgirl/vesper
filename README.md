@@ -1,7 +1,6 @@
 # Cider Agent
 
-`cider_agent` is a dedicated music-control agent for the Cider Apple Music client. It exposes a text-first A2A interface for delegation from another agent, plus a local CLI for direct use.
-It also exposes a small MCP tool surface for hosts that want direct playback control plus one natural-language entrypoint.
+`cider_agent` is a dedicated music-control agent for the Cider Apple Music client. It exposes a local CLI for direct use, a text-first A2A interface for delegation from another agent, and a small MCP tool surface for hosts that want direct playback control plus one natural-language entrypoint.
 
 The project is built around a simple idea: keep the main conversational agent lean, and hand off music work to a narrow specialist.
 
@@ -88,12 +87,13 @@ cider-agent ask "i don't like this"
 cider-agent ask "i like this track"
 ```
 
-Start the A2A server:
+The CLI commands work directly against the local service and do not require any HTTP server to be running.
+`cider-agent serve` requires at least one transport flag: `--a2a`, `--mcp`, or both.
+
+Start the A2A HTTP transport:
 
 ```bash
-cider-agent-serve
-# or
-cider-agent serve
+cider-agent serve --a2a
 ```
 
 Run the MCP server over stdio:
@@ -102,15 +102,23 @@ Run the MCP server over stdio:
 cider-agent mcp
 ```
 
-Run A2A and also mount MCP over HTTP:
+Start the MCP HTTP transport:
 
 ```bash
 cider-agent serve --mcp
-# or
-cider-agent-serve --mcp
 ```
 
-Published endpoints:
+Run A2A and MCP together over HTTP:
+
+```bash
+cider-agent serve --a2a --mcp
+```
+
+Common HTTP endpoint available whenever either HTTP transport is enabled:
+
+- `GET /healthz`
+
+A2A HTTP endpoints when `--a2a` is enabled:
 
 - `POST /a2a`
 - `GET /.well-known/agent-card`
@@ -122,7 +130,9 @@ Published endpoints:
 - `POST /tasks/{id}:cancel`
 - `GET /tasks/{id}:subscribe`
 - `POST /tasks/{id}:subscribe`
-- `GET /healthz`
+
+MCP HTTP endpoint when `--mcp` is enabled:
+
 - `POST /mcp`
 
 ## A2A Usage
@@ -211,7 +221,12 @@ Playlist listing, playlist play-by-name, adaptive sessions, queue-aware behavior
 
 ## MCP Usage
 
-The MCP surface is intentionally smaller than the internal action registry. Exposed MCP tools:
+The MCP surface is intentionally smaller than the internal action registry. It is available in two forms:
+
+- stdio via `cider-agent mcp`
+- Streamable HTTP via `cider-agent serve --mcp` or `cider-agent serve --a2a --mcp`
+
+Exposed MCP tools:
 
 - `play`
 - `pause`
@@ -219,7 +234,8 @@ The MCP surface is intentionally smaller than the internal action registry. Expo
 - `previous`
 - `ask`
 
-`ask` is the rich entrypoint. It reuses the same text-first behavior as A2A and CLI requests, so richer behavior such as adaptive sessions, playlist requests, and feedback requests should go through `ask`.
+`ask` is the rich entrypoint. It reuses the same text-first behavior as A2A and CLI requests, so richer behavior such as adaptive sessions, playlist requests, feedback requests, and status-like queries should go through `ask`.
+The direct transport tools are intentionally narrow and best used for obvious playback commands.
 
 Example MCP host config:
 
@@ -234,16 +250,24 @@ Example MCP host config:
 }
 ```
 
-When MCP is mounted over HTTP with `cider-agent serve --mcp`, the Streamable HTTP endpoint is:
+When MCP is mounted over HTTP with `cider-agent serve --mcp` or `cider-agent serve --a2a --mcp`, the Streamable HTTP endpoint is:
 
 ```text
 http://127.0.0.1:8766/mcp
 ```
 
+Typical MCP usage pattern:
+
+- `ask("play some music")`
+- `ask("what's playing?")`
+- `pause()`
+- `play()`
+- `next()`
+
 ## How It Works
 
 - The core service owns playback, search, session state, and preference memory.
-- The CLI and A2A server are thin adapters over that same service layer.
+- The CLI, A2A transport, and MCP transport are thin adapters over that same service layer.
 - Descriptive or vague `play` requests usually start an adaptive session instead of one-shot playback.
 - Adaptive sessions search real Apple Music candidates first, then ask the resolver to choose from a small candidate window instead of making it invent songs.
 - Very vague requests such as `play some music` can bootstrap from saved liked-track cues, favored artists, and directly liked tracks before normal adaptive selection takes over.

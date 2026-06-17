@@ -68,7 +68,7 @@ def _extract_data_parts(parts: list[dict[str, Any]]) -> dict[str, Any]:
 def _app(monkeypatch, service, settings):
     monkeypatch.setattr(a2a, "get_service", lambda: service)
     monkeypatch.setattr(a2a, "get_settings", lambda: settings)
-    return a2a.create_a2a_app()
+    return a2a.create_http_app(include_a2a=True)
 
 
 async def _request(app, method: str, path: str, **kwargs: Any) -> httpx.Response:

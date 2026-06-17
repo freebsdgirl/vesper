@@ -10,7 +10,7 @@ from mcp.shared.memory import create_connected_server_and_client_session
 import pytest
 
 from cider_agent import a2a, mcp_server
-from cider_agent.a2a import create_a2a_app
+from cider_agent.a2a import create_http_app
 from cider_agent.config import Settings
 from cider_agent.service import CiderAgentService
 from cider_agent.storage import PreferenceStore
@@ -111,7 +111,7 @@ def test_mcp_ask_rejects_empty_text(monkeypatch, tmp_path: Path) -> None:
     anyio.run(_exercise)
 
 
-def test_a2a_app_optionally_exposes_mcp(monkeypatch, tmp_path: Path) -> None:
+def test_http_app_enables_requested_transports(monkeypatch, tmp_path: Path) -> None:
     settings, service = _make_service(tmp_path)
     monkeypatch.setattr(a2a, "get_settings", lambda: settings)
     monkeypatch.setattr(a2a, "get_service", lambda: service)
@@ -119,25 +119,38 @@ def test_a2a_app_optionally_exposes_mcp(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(mcp_server, "get_service", lambda: service)
 
     async def _exercise() -> None:
-        without_mcp = create_a2a_app(include_mcp=False)
-        with_mcp = create_a2a_app(include_mcp=True)
+        a2a_only = create_http_app(include_a2a=True)
+        mcp_only = create_http_app(include_mcp=True)
+        both = create_http_app(include_a2a=True, include_mcp=True)
 
-        async with without_mcp.router.lifespan_context(without_mcp):
-            transport_without = httpx.ASGITransport(app=without_mcp)
+        async with a2a_only.router.lifespan_context(a2a_only):
+            transport_without = httpx.ASGITransport(app=a2a_only)
             async with httpx.AsyncClient(
                 transport=transport_without,
                 base_url="http://127.0.0.1:8766",
                 follow_redirects=True,
             ) as client:
                 missing = await client.post("/mcp", json={})
+                agent_card = await client.get("/.well-known/agent-card")
                 assert missing.status_code == 404
+                assert agent_card.status_code == 200
 
-        async with with_mcp.router.lifespan_context(with_mcp):
-            transport_with = httpx.ASGITransport(app=with_mcp)
+        async with mcp_only.router.lifespan_context(mcp_only):
+            transport_with = httpx.ASGITransport(app=mcp_only)
             async with httpx.AsyncClient(transport=transport_with, base_url="http://127.0.0.1:8766") as client:
                 health = await client.get("/healthz")
                 mcp_response = await client.post("/mcp", json={})
+                agent_card = await client.get("/.well-known/agent-card")
                 assert health.status_code == 200
+                assert mcp_response.status_code in {200, 400, 406}
+                assert agent_card.status_code == 404
+
+        async with both.router.lifespan_context(both):
+            transport_both = httpx.ASGITransport(app=both)
+            async with httpx.AsyncClient(transport=transport_both, base_url="http://127.0.0.1:8766") as client:
+                agent_card = await client.get("/.well-known/agent-card")
+                mcp_response = await client.post("/mcp", json={})
+                assert agent_card.status_code == 200
                 assert mcp_response.status_code in {200, 400, 406}
 
     anyio.run(_exercise)
@@ -150,7 +163,7 @@ def test_streamable_http_client_can_call_mounted_mcp(monkeypatch, tmp_path: Path
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
     monkeypatch.setattr(mcp_server, "get_service", lambda: service)
 
-    app = create_a2a_app(include_mcp=True)
+    app = create_http_app(include_mcp=True)
 
     def client_factory(headers=None, timeout=None, auth=None):
         return httpx.AsyncClient(

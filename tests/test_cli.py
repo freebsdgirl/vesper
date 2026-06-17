@@ -1,66 +1,106 @@
 from __future__ import annotations
 
-import pytest
+import json
 
-from a2a.helpers import new_data_part, new_task, new_text_part
-from a2a.types import Message, Role, TaskState
+import pytest
 
 from cider_agent import cli
 from cider_agent.errors import TextRequestExecutionError
 
 
-def test_call_local_a2a_returns_completed_task(monkeypatch) -> None:
-    async def fake_send_local_a2a_request(message: Message):
-        assert message.role == Role.ROLE_USER
-        return new_task(
-            task_id="task-1",
-            context_id="ctx-1",
-            state=TaskState.TASK_STATE_COMPLETED,
-            artifacts=[
-                {
-                    "artifact_id": "artifact-1",
-                    "name": "cider-agent-result",
-                    "parts": [new_data_part({"status": "ok"}, media_type="application/json")],
-                    "metadata": {"reasoning": "thinking thoughts"},
-                }
-            ],
-        )
+def test_cli_play_calls_service_directly(monkeypatch, capsys) -> None:
+    class FakeService:
+        def play(self):
+            return {"status": "ok", "result": {"path": "/play", "body": None}}
 
-    monkeypatch.setattr(cli, "_send_local_a2a_request", fake_send_local_a2a_request)
+    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+    monkeypatch.setattr("sys.argv", ["cider-agent", "play"])
 
-    task = cli._call_local_a2a(
-        cli._build_user_message(action="pause", parameters={}),
-    )
+    cli.main()
 
-    assert task.status.state == TaskState.TASK_STATE_COMPLETED
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["path"] == "/play"
 
 
-def test_call_local_a2a_raises_for_failed_task(monkeypatch) -> None:
-    failed = new_task(
-        task_id="task-2",
-        context_id="ctx-2",
-        state=TaskState.TASK_STATE_FAILED,
-        history=[],
-    )
-    failed.status.message.CopyFrom(
-        Message(
-            role=Role.ROLE_AGENT,
-            parts=[
-                new_text_part("No active session is running.", media_type="text/plain"),
-                new_data_part(
-                    {"status": "error", "message": "No active session is running."},
-                    media_type="application/json",
-                ),
-            ],
-        )
-    )
+def test_cli_ask_calls_service_directly(monkeypatch, capsys) -> None:
+    class FakeService:
+        def handle_text_request(self, text: str):
+            assert text == "play some kep1er"
+            return {"status": "ok", "input": text, "summary": "done"}
 
-    async def fake_send_local_a2a_request(message: Message):
-        return failed
+    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+    monkeypatch.setattr("sys.argv", ["cider-agent", "ask", "play some kep1er"])
 
-    monkeypatch.setattr(cli, "_send_local_a2a_request", fake_send_local_a2a_request)
+    cli.main()
 
-    with pytest.raises(TextRequestExecutionError, match="No active session is running."):
-        cli._call_local_a2a(
-            cli._build_user_message(action="stop", parameters={}),
-        )
+    captured = capsys.readouterr()
+    assert json.loads(captured.out)["input"] == "play some kep1er"
+
+
+def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
+    class FakeService:
+        def handle_text_request(self, text: str):
+            raise TextRequestExecutionError("No active session.", {"status": "error", "message": "No active session."})
+
+    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+    monkeypatch.setattr("sys.argv", ["cider-agent", "ask", "stop session"])
+
+    with pytest.raises(SystemExit, match="1"):
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert json.loads(captured.err)["message"] == "No active session."
+
+
+def test_serve_requires_transport_flag(monkeypatch) -> None:
+    monkeypatch.setattr("sys.argv", ["cider-agent", "serve"])
+
+    with pytest.raises(SystemExit, match="2"):
+        cli.main()
+
+
+def test_serve_accepts_a2a_transport(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("sys.argv", ["cider-agent", "serve", "--a2a"])
+    monkeypatch.setattr(cli, "get_settings", lambda: type("Settings", (), {"http_host": "127.0.0.1", "http_port": 8766})())
+
+    def fake_create_http_app(*, include_a2a: bool, include_mcp: bool):
+        captured["flags"] = (include_a2a, include_mcp)
+        return object()
+
+    def fake_run(app, *, host, port, reload):
+        captured["app"] = app
+        captured["host"] = host
+        captured["port"] = port
+        captured["reload"] = reload
+
+    monkeypatch.setattr("cider_agent.a2a.create_http_app", fake_create_http_app)
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    cli.main()
+
+    assert captured["flags"] == (True, False)
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 8766
+
+
+def test_serve_accepts_both_transports(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("sys.argv", ["cider-agent", "serve", "--a2a", "--mcp"])
+    monkeypatch.setattr(cli, "get_settings", lambda: type("Settings", (), {"http_host": "127.0.0.1", "http_port": 8766})())
+
+    def fake_create_http_app(*, include_a2a: bool, include_mcp: bool):
+        captured["flags"] = (include_a2a, include_mcp)
+        return object()
+
+    def fake_run(app, *, host, port, reload):
+        captured["app"] = app
+
+    monkeypatch.setattr("cider_agent.a2a.create_http_app", fake_create_http_app)
+    monkeypatch.setattr("uvicorn.run", fake_run)
+
+    cli.main()
+
+    assert captured["flags"] == (True, True)
