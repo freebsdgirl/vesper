@@ -415,7 +415,7 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
     mcp_server = None
     mcp_endpoint = None
     if include_mcp:
-        mcp_server = create_mcp_server(streamable_http_path="/")
+        mcp_server = create_mcp_server(streamable_http_path="/", manage_session_worker=False)
         mcp_app = mcp_server.streamable_http_app()
         mcp_endpoint = mcp_app.routes[0].endpoint
 

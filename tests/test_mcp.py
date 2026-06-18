@@ -187,3 +187,40 @@ def test_streamable_http_client_can_call_mounted_mcp(monkeypatch, tmp_path: Path
                     assert result.structuredContent["result"]["path"] == "/play"
 
     anyio.run(_exercise)
+
+
+def test_mounted_mcp_requests_do_not_stop_parent_session_worker(monkeypatch, tmp_path: Path) -> None:
+    settings, service = _make_service(tmp_path)
+    monkeypatch.setattr(a2a, "get_settings", lambda: settings)
+    monkeypatch.setattr(a2a, "get_service", lambda: service)
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
+    monkeypatch.setattr(mcp_server, "get_service", lambda: service)
+
+    app = create_http_app(include_mcp=True)
+
+    def client_factory(headers=None, timeout=None, auth=None):
+        return httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://127.0.0.1:8766",
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+            follow_redirects=True,
+        )
+
+    async def _exercise() -> None:
+        async with app.router.lifespan_context(app):
+            worker = service._session_worker_thread
+            assert worker is not None
+            assert worker.is_alive()
+
+            async with streamablehttp_client("http://127.0.0.1:8766/mcp", httpx_client_factory=client_factory) as streams:
+                read_stream, write_stream, _ = streams
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    await session.list_tools()
+
+            assert service._session_worker_thread is worker
+            assert worker.is_alive()
+
+    anyio.run(_exercise)

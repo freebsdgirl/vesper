@@ -21,7 +21,15 @@ async def _mcp_lifespan(_: FastMCP):
         service.stop_background_session_worker()
 
 
-def create_mcp_server(*, streamable_http_path: str = "/mcp") -> FastMCP:
+@asynccontextmanager
+async def _embedded_mcp_lifespan(_: FastMCP):
+    # The parent HTTP app owns the shared session worker. FastMCP invokes its
+    # lifespan for stateless request sessions, so stopping the worker here
+    # would disable adaptive-session auto-advance after every MCP request.
+    yield
+
+
+def create_mcp_server(*, streamable_http_path: str = "/mcp", manage_session_worker: bool = True) -> FastMCP:
     settings = get_settings()
     server = FastMCP(
         "vesper",
@@ -35,7 +43,7 @@ def create_mcp_server(*, streamable_http_path: str = "/mcp") -> FastMCP:
         json_response=True,
         stateless_http=True,
         log_level=settings.log_level,
-        lifespan=_mcp_lifespan,
+        lifespan=_mcp_lifespan if manage_session_worker else _embedded_mcp_lifespan,
     )
 
     @server.tool(name="play", description="Resume playback.", structured_output=True)
