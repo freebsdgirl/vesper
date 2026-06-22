@@ -3040,6 +3040,8 @@ class CiderAgentService:
         if self._looks_like_play_candidate_result(value):
             return self._compact_play_candidate_result(value)
 
+        if self._looks_like_music_preference(value):
+            return self._compact_music_preference(value)
         if self._looks_like_track(value):
             return self._compact_track(value)
         if self._looks_like_playlist(value):
@@ -3152,6 +3154,14 @@ class CiderAgentService:
                 compact[key] = track[key]
         return compact
 
+    def _compact_music_preference(self, preference: dict[str, Any]) -> dict[str, Any]:
+        preference_type = preference.get("preference_type")
+        if preference_type == "favored_artist":
+            keys = ("artist_name",)
+        else:
+            keys = ("title", "artist_name")
+        return {key: preference[key] for key in keys if preference.get(key) is not None}
+
     def _compact_playlist(self, playlist: dict[str, Any]) -> dict[str, Any]:
         return {
             key: playlist[key]
@@ -3257,6 +3267,13 @@ class CiderAgentService:
 
     def _looks_like_track(self, value: dict[str, Any]) -> bool:
         return "title" in value and ("artist" in value or "play_params" in value or "track_id" in value)
+
+    def _looks_like_music_preference(self, value: dict[str, Any]) -> bool:
+        return value.get("preference_type") in {
+            "liked_track",
+            "favored_artist",
+            "globally_rejected_track",
+        }
 
     def _looks_like_playlist(self, value: dict[str, Any]) -> bool:
         return "name" in value and ("can_edit" in value or "is_public" in value) and "title" not in value

@@ -110,6 +110,19 @@ def test_handle_text_request_uses_resolver(service) -> None:
     assert isinstance(result["summary"], str)
 
 
+def test_handle_text_request_compacts_liked_track_as_title_and_artist(service) -> None:
+    result = service.handle_text_request("i like this song")
+
+    assert result["execution"]["result"]["liked_track"] == {
+        "title": "Track",
+        "artist_name": "Artist",
+    }
+    assert result["execution"]["result"]["favored_artist"] == {
+        "artist_name": "Artist",
+    }
+    assert result["summary"] == "saved Track by Artist"
+
+
 def test_handle_text_request_includes_timings_when_enabled(settings, service, tmp_path) -> None:
     timed_settings = Settings(
         http_host=settings.http_host,
