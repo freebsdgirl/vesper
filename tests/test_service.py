@@ -1940,7 +1940,7 @@ def test_paused_session_runtime_survives_restart(settings, service, tmp_path) ->
     assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
-def test_active_stopped_session_is_suspended_after_restart(settings, service, tmp_path) -> None:
+def test_active_stopped_session_remains_eligible_after_restart(settings, service, tmp_path) -> None:
     database_path = tmp_path / "active-restart.db"
     rpc = service._rpc.__class__()
     first = CiderAgentService(
@@ -1973,6 +1973,9 @@ def test_active_stopped_session_is_suspended_after_restart(settings, service, tm
     first.play_session("play upbeat music")
     rpc.is_playing = False
     rpc.current_track = None
+    session = first._preferences.get_active_session()
+    assert session is not None
+    first._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
 
     restarted = CiderAgentService(
         first._settings,
@@ -1983,11 +1986,12 @@ def test_active_stopped_session_is_suspended_after_restart(settings, service, tm
 
     session = restarted._preferences.get_active_session()
     assert session is not None
-    assert restarted._get_session_runtime(session["id"])["suspended"] is True
-    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
+    assert restarted._get_session_runtime(session["id"])["suspended"] is False
+    assert restarted._preferences.get_session_runtime(session["id"])["active_intent"] == "active"
+    assert restarted._should_advance_session(session, restarted.playback_snapshot()) is True
 
 
-def test_explicit_play_resumes_stopped_session_after_restart(settings, service, tmp_path) -> None:
+def test_explicit_play_advances_stopped_active_session_after_restart(settings, service, tmp_path) -> None:
     database_path = tmp_path / "resume-after-restart.db"
     rpc = service._rpc.__class__()
     first = CiderAgentService(
@@ -2030,7 +2034,7 @@ def test_explicit_play_resumes_stopped_session_after_restart(settings, service, 
 
     session = restarted._preferences.get_active_session()
     assert session is not None
-    assert restarted._get_session_runtime(session["id"])["suspended"] is True
+    assert restarted._get_session_runtime(session["id"])["suspended"] is False
 
     result = restarted.play()
 

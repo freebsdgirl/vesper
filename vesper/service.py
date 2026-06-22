@@ -395,9 +395,11 @@ class CiderAgentService:
             return
         stored_runtime = self._preferences.get_session_runtime(session["id"]) or {}
         playback = self.playback_snapshot()
-        # Never auto-resume a stopped adaptive session just because the service
-        # process restarted. Explicit resume/play commands can unsuspend it.
-        suspended = stored_runtime.get("active_intent") == "suspended" or not bool(playback.get("is_playing"))
+        # Playback naturally becomes stopped between adaptive-session tracks.
+        # Starting another service process during that window (for example, a
+        # one-shot CLI status request) must not turn the shared session into an
+        # explicitly suspended one. Only persisted user intent may suspend it.
+        suspended = stored_runtime.get("active_intent") == "suspended"
         self._set_session_runtime(
             session["id"],
             suspended=suspended,
