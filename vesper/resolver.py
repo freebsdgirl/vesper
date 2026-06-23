@@ -40,6 +40,7 @@ class SessionQueryPlan:
 
     search_sources: list[SessionSearchSource]
     resolver: str
+    queue_policy: str = "source_order"
     raw: dict[str, Any] | None = None
     reasoning: str | None = None
     raw_content: str | None = None
@@ -68,6 +69,18 @@ class SessionTrackSelection:
 
     selected_index: int
     resolver: str
+    raw: dict[str, Any] | None = None
+    reasoning: str | None = None
+    raw_content: str | None = None
+
+
+@dataclass
+class SessionQueueDecision:
+    """Resolver decision for filtering remaining session queue candidates."""
+
+    eligible_indices: list[int]
+    resolver: str
+    queue_policy: str = "source_order"
     raw: dict[str, Any] | None = None
     reasoning: str | None = None
     raw_content: str | None = None
@@ -112,6 +125,15 @@ class Resolver(Protocol):
     ) -> str | None:
         """Return an alternate vibe playlist search term after empty results."""
 
+    def filter_session_queue(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> SessionQueueDecision:
+        """Filter or choose a coarse policy for a batch of queued tracks."""
+
 
 class FallbackResolver:
     """Minimal deterministic fallback for obvious direct commands."""
@@ -137,6 +159,11 @@ class FallbackResolver:
 
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int) -> SessionQueryPlan:
         query = request.strip()
+        if self._is_vague_play_request(query):
+            return SessionQueryPlan(
+                search_sources=[SessionSearchSource(kind="preference", term="__preference_seeded__")],
+                resolver="fallback",
+            )
         return SessionQueryPlan(
             search_sources=[SessionSearchSource(kind="vibe", term=query)] if query else [],
             resolver="fallback",
@@ -171,6 +198,32 @@ class FallbackResolver:
         attempted_terms: list[str],
     ) -> str | None:
         return None
+
+    def filter_session_queue(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> SessionQueueDecision:
+        return SessionQueueDecision(eligible_indices=list(range(len(candidates))), resolver="fallback")
+
+    def _is_vague_play_request(self, value: Any) -> bool:
+        text = str(value or "").strip().casefold()
+        if not text:
+            return False
+        compact = re.sub(r"[^a-z0-9]+", " ", text)
+        compact = " ".join(compact.split())
+        return compact in {
+            "play music",
+            "play some music",
+            "play some songs",
+            "play something",
+            "play something good",
+            "play anything",
+            "some music",
+            "music please",
+        }
 
 
 class OpenAICompatibleResolver:
@@ -281,6 +334,7 @@ class OpenAICompatibleResolver:
         return SessionQueryPlan(
             search_sources=search_sources,
             resolver="openai_compatible",
+            queue_policy=self._normalize_queue_policy(parsed.get("queue_policy")),
             raw=parsed,
             reasoning=self._extract_reasoning(body),
             raw_content=self._extract_raw_content(content),
@@ -370,6 +424,32 @@ class OpenAICompatibleResolver:
             return None
         return normalized[:120]
 
+    def filter_session_queue(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> SessionQueueDecision:
+        if not candidates:
+            return SessionQueueDecision(eligible_indices=[], resolver="openai_compatible")
+        headers = {"Content-Type": "application/json"}
+        if self._settings.resolver_api_key:
+            headers["Authorization"] = f"Bearer {self._settings.resolver_api_key}"
+        messages = self._build_session_queue_filter_messages(request, service, session, candidates)
+        body, content, parsed = self._complete_parsed_json(messages, headers)
+        logger = getattr(service, "append_resolver_debug_log", None)
+        if callable(logger):
+            logger(stage="filter_session_queue", messages=messages, response_body=body, response_content=content)
+        return SessionQueueDecision(
+            eligible_indices=self._normalize_eligible_indices(parsed.get("eligible_indices"), len(candidates)),
+            resolver="openai_compatible",
+            queue_policy=self._normalize_queue_policy(parsed.get("queue_policy")),
+            raw=parsed,
+            reasoning=self._extract_reasoning(body),
+            raw_content=self._extract_raw_content(content),
+        )
+
     def _build_messages(self, text: str, service: Any) -> list[dict[str, str]]:
         playback = service.playback_snapshot()
         active_session = service.session_status(include_recent_tracks=False, compact=False).get("session")
@@ -382,7 +462,6 @@ class OpenAICompatibleResolver:
                 "queue_length": playback.get("queue_length"),
             },
             "active_session": active_session,
-            "preferences": service.list_preferences()["preferences"][:5],
             "allowed_actions": self._resolver_action_specs(),
         }
         system = (
@@ -416,7 +495,6 @@ class OpenAICompatibleResolver:
             "session_request": session.get("request_text"),
             "session_steering": session.get("steering_history", [])[-5:],
             "playback_summary": self._compact_session_playback_summary(service.session_planning_playback_snapshot(session)),
-            "preferences": service.list_preferences()["preferences"][:5],
             "supported_genres": service.session_genre_names(),
             "rejected_sources": service.session_rejected_search_sources(session),
             "count": count,
@@ -424,11 +502,13 @@ class OpenAICompatibleResolver:
         system = (
             "You are planning the next typed source for an adaptive music session in Vesper. "
             "Return only JSON with key search_sources, containing objects with kind and term. "
+            "You may also return queue_policy as source_order or shuffle. "
             f"The session needs {count} source right now; return exactly 1 source when possible. "
-            "Allowed kinds are artist, genre, and vibe. "
+            "Allowed kinds are artist, genre, vibe, and preference. "
             "Use artist for artist names, including artist-plus-mood requests; put only the artist name in term. "
             "Use genre only when term exactly matches one of supported_genres. "
             "Use vibe for genre-plus-mood/activity, unsupported subgenres, and descriptive requests. "
+            "Use preference for extremely vague requests where saved preferences should seed playback. "
             "If supported_genres is empty, never use genre. "
             "Never repeat a source listed in rejected_sources; choose a materially different source. "
             "Honor the original session_request, steering changes, and the current timestamp. "
@@ -507,7 +587,7 @@ class OpenAICompatibleResolver:
                 continue
             kind = str(item.get("kind", "")).strip().lower()
             term = str(item.get("term", "")).strip()
-            if kind not in {"artist", "genre", "vibe"} or not term:
+            if kind not in {"artist", "genre", "vibe", "preference"} or not term:
                 continue
             key = (kind, term.casefold())
             if key in seen:
@@ -550,6 +630,34 @@ class OpenAICompatibleResolver:
             {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nChoose the best candidate index for the next track."},
         ]
 
+    def _build_session_queue_filter_messages(
+        self,
+        request: str,
+        service: Any,
+        session: dict[str, Any],
+        candidates: list[dict[str, Any]],
+    ) -> list[dict[str, str]]:
+        context = {
+            "current_timestamp": service.current_timestamp(),
+            "session_request": session.get("request_text"),
+            "session_steering": session.get("steering_history", [])[-5:],
+            "candidates": [
+                self._compact_session_selection_candidate(candidate)
+                for candidate in candidates[:20]
+            ],
+        }
+        system = (
+            "Filter a batch of remaining queued tracks for an adaptive music session after steering. "
+            "Return only JSON with shape {\"eligible_indices\": [number], \"queue_policy\": \"source_order\"}. "
+            "Use eligible_indices to keep candidates that still fit the session request and steering. "
+            "Use queue_policy source_order by default, or shuffle only when the user asks for variety/randomness. "
+            "Indices are zero-based within the shown candidates."
+        )
+        return [
+            {"role": "system", "content": system},
+            {"role": "user", "content": f"Context:\n{json.dumps(context, ensure_ascii=True)}\n\nFilter this queue batch."},
+        ]
+
     def _compact_session_selection_candidate(self, candidate: dict[str, Any]) -> dict[str, Any]:
         compact: dict[str, Any] = {}
         for key in ("id", "title", "artist", "album"):
@@ -571,6 +679,24 @@ class OpenAICompatibleResolver:
                 if key in track
             }
         return compact
+
+    def _normalize_queue_policy(self, value: Any) -> str:
+        policy = str(value or "source_order").strip().lower()
+        return policy if policy in {"source_order", "shuffle"} else "source_order"
+
+    def _normalize_eligible_indices(self, value: Any, candidate_count: int) -> list[int]:
+        if not isinstance(value, list):
+            return list(range(candidate_count))
+        indices: list[int] = []
+        seen: set[int] = set()
+        for item in value:
+            if not isinstance(item, int):
+                continue
+            if item < 0 or item >= candidate_count or item in seen:
+                continue
+            seen.add(item)
+            indices.append(item)
+        return indices
 
     def _complete_json(self, messages: list[dict[str, str]], headers: dict[str, str]) -> tuple[dict[str, Any], str]:
         payload = {

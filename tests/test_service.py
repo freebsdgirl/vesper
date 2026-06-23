@@ -417,7 +417,7 @@ def test_next_track_advances_active_session_without_native_queue(service) -> Non
 
     assert result["status"] == "ok"
     assert result["selection_strategy"] == "adaptive-session-skip"
-    assert result["tracks"][0]["title"] == "Another Song"
+    assert result["tracks"][0]["title"] == "Liked Song"
     assert service._rpc.posts[-1]["path"] == "/play-item"
 
 
@@ -437,6 +437,48 @@ def test_session_worker_advances_when_playback_stops(service) -> None:
 
     assert result["selection_strategy"] == "adaptive-session-auto-advance"
     assert result["tracks"][0]["title"] == "Liked Song"
+
+
+def test_session_worker_does_not_advance_when_now_playing_has_remaining_time(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track["attributes"]["currentPlaybackTime"] = 15
+    service._rpc.current_track["attributes"]["remainingTime"] = 165
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    assert service._should_advance_session(session, service.playback_snapshot()) is False
+
+
+def test_session_worker_does_not_advance_when_playing_state_is_unknown(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    playback = service.playback_snapshot()
+    playback["is_playing"] = None
+    playback["track"] = None
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    assert service._should_advance_session(session, playback) is False
+
+
+def test_session_worker_can_advance_when_now_playing_track_has_ended(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track["attributes"]["currentPlaybackTime"] = 180
+    service._rpc.current_track["attributes"]["remainingTime"] = 0
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    assert service._should_advance_session(session, service.playback_snapshot()) is True
 
 
 def test_session_worker_respects_persisted_cooldown_across_processes(settings, service, tmp_path) -> None:
@@ -875,10 +917,10 @@ def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(sett
     assert [entry["track"]["title"] for entry in built_pool["entries"]] == ["Liked Song"]
 
 
-def test_session_search_cache_reuses_large_result_pool_without_requerying(service) -> None:
-    class WindowRejectingResolver:
+def test_materialized_session_queue_reuses_large_result_pool_without_requerying(service) -> None:
+    class QueueResolver:
         def __init__(self) -> None:
-            self.windows: list[list[str]] = []
+            self.selection_calls = 0
 
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
@@ -904,26 +946,22 @@ def test_session_search_cache_reuses_large_result_pool_without_requerying(servic
             search_query: str,
             candidates: list[dict[str, object]],
         ):
-            self.windows.append([str(candidate.get("title")) for candidate in candidates])
-            if candidates and candidates[0].get("title") == "Wide Song 1":
-                return type("Selection", (), {"selected_index": -1, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
-            return type("Selection", (), {"selected_index": 0, "resolver": "stub", "raw": None, "reasoning": None, "raw_content": None})()
+            self.selection_calls += 1
+            raise AssertionError("advance should not call select_session_track")
 
-    service._resolver = WindowRejectingResolver()
+    service._resolver = QueueResolver()
     session = service._preferences.start_session(request_text="play upbeat music")
 
-    result = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+    first = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+    second = service._play_session_track(session, selection_strategy="adaptive-session-manual-advance")
+    queue = service.session_queue(limit=20, include_history=True)
 
-    assert result["tracks"][0]["title"] == "Wide Song 7"
+    assert first["tracks"][0]["title"] == "Wide Song 1"
+    assert second["tracks"][0]["title"] == "Wide Song 2"
     assert len(service._rpc.search_catalog_calls) == 1
-    assert service._resolver.windows == [
-        [f"Wide Song {index}" for index in range(1, 7)],
-        ["Wide Song 7", "Wide Song 8"],
-    ]
-    runtime = service._get_session_runtime(session["id"])
-    pool = next(iter(runtime["query_pools"].values()))
-    assert [entry["state"] for entry in pool["entries"][:6]] == ["screened_out"] * 6
-    assert pool["cursor"] == 0
+    assert service._resolver.selection_calls == 0
+    assert [item["title"] for item in queue["items"][:3]] == ["Wide Song 1", "Wide Song 2", "Wide Song 3"]
+    assert [item["state"] for item in queue["items"][:3]] == ["played", "playing", "queued"]
 
 
 def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings, tmp_path) -> None:
@@ -1181,8 +1219,8 @@ def test_resolver_debug_log_resets_between_track_selection_episodes(settings, se
     debug_service.next_track()
     second_log = debug_log_path.read_text(encoding="utf-8")
     assert "reason: adaptive-session-skip" in second_log
-    assert "query-2" in second_log
     assert "query-1" not in second_log
+    assert debug_service._resolver.plan_calls == 1
 
 
 def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp_path) -> None:
@@ -1271,8 +1309,8 @@ def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp
 
     second_log = debug_log_path.read_text(encoding="utf-8")
     assert "reason: adaptive-session-auto-advance" in second_log
-    assert "auto-query-2" in second_log
     assert "auto-query-1" not in second_log
+    assert debug_service._resolver.plan_calls == 1
 
 
 def test_preserve_steering_keeps_session_query_pools(service) -> None:
@@ -2002,6 +2040,55 @@ def test_paused_session_runtime_survives_restart(settings, service, tmp_path) ->
     assert restarted._should_advance_session(session, restarted.playback_snapshot()) is False
 
 
+def test_reconcile_preserves_current_playing_queue_item(settings, service, tmp_path) -> None:
+    database_path = tmp_path / "playing-queue-restart.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    session = first._preferences.get_active_session()
+    assert session is not None
+    assert first.session_queue(include_history=True)["items"][0]["state"] == "playing"
+    post_count = len(rpc.posts)
+
+    restarted = CiderAgentService(
+        first._settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=first._resolver,
+    )
+
+    queue = restarted.session_queue(include_history=True)
+    assert queue["items"][0]["state"] == "playing"
+    assert restarted._get_session_runtime(session["id"])["current_queue_item_id"] == queue["items"][0]["id"]
+    assert len(rpc.posts) == post_count
+
+
 def test_active_stopped_session_remains_eligible_after_restart(settings, service, tmp_path) -> None:
     database_path = tmp_path / "active-restart.db"
     rpc = service._rpc.__class__()
@@ -2244,27 +2331,27 @@ def test_worker_exits_at_phase_boundary_on_cancel(service) -> None:
         session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
     )
 
-    # Park the worker mid-collect (inside the resolver chooser) so the stop
+    # Park the worker while it rebuilds the materialized queue so the stop
     # signal arrives while an advance is genuinely in flight.
     gate = threading.Event()
-    entered_select = threading.Event()
-    original_select = service._resolver.select_session_track
+    entered_search = threading.Event()
+    original_search = service._rpc.search_catalog
 
-    def blocking_select(request, host, sess, search_query, candidates):
-        entered_select.set()
+    def blocking_search(query, *, limit, storefront, offset=0):
+        entered_search.set()
         gate.wait(timeout=5.0)
-        return original_select(request, host, sess, search_query, candidates)
+        return original_search(query, limit=limit, storefront=storefront, offset=offset)
 
-    service._resolver.select_session_track = blocking_select
+    service._rpc.search_catalog = blocking_search
 
     service.start_background_session_worker()
     worker_thread = service._session_worker_thread
     assert worker_thread is not None
 
-    # Wait until the worker is actually blocked mid-collect.
-    assert entered_select.wait(timeout=5.0)
+    # Wait until the worker is actually blocked mid-materialization.
+    assert entered_search.wait(timeout=5.0)
 
-    # Request cooperative shutdown, then release the in-flight collect.
+    # Request cooperative shutdown, then release the in-flight materialization.
     service._session._session_worker_stop.set()
     gate.set()
 

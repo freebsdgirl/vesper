@@ -12,7 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vesper.config import Settings
 from vesper.rpc import CiderRpcClient
-from vesper.resolver import ResolvedAction
+from vesper.resolver import ResolvedAction, SessionQueryPlan, SessionSearchSource
 from vesper.service import CiderAgentService
 from vesper.storage import PreferenceStore
 
@@ -347,6 +347,11 @@ class StubResolver:
 
     def plan_session(self, request: str, service: Any, session: dict[str, Any], count: int):
         self.session_plan_calls += 1
+        if request.strip().casefold() in {"play some music", "play music", "play something"}:
+            return SessionQueryPlan(
+                search_sources=[SessionSearchSource(kind="preference", term="__preference_seeded__")],
+                resolver="stub",
+            )
         if self.session_plan_calls == 1:
             query = "Favorite Artist Liked Song"
         elif self.session_plan_calls == 2:

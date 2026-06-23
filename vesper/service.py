@@ -1130,6 +1130,9 @@ class CiderAgentService:
     def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
         return self._session.session_status(include_recent_tracks=include_recent_tracks, compact=compact)
 
+    def session_queue(self, *, limit: int = 50, include_history: bool = False) -> dict[str, Any]:
+        return self._session.session_queue(limit=limit, include_history=include_history)
+
     def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         return self._session.recent_session_tracks(limit=limit)
 
@@ -1566,4 +1569,3 @@ class CiderAgentService:
         if not item_id:
             raise CiderValidationError("Resolved track did not include a playable id.")
         return self.play_later({"id": item_id, "type": kind, "isLibrary": is_library})
-

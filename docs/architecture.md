@@ -67,13 +67,15 @@ Natural-language text can reach richer behavior such as playlist lookup, adaptiv
 - `FallbackResolver` handles obvious deterministic commands such as `play`, `pause`, `stop`, `next`, `previous`, and `status`.
 - `OpenAICompatibleResolver` calls an OpenAI-compatible chat-completions endpoint when general text resolution is needed.
 
-Resolver use is deliberately constrained. It should choose from known actions, create small query plans, or select from real search candidates. It should not invent tracks as if it were a catalog.
+Resolver use is deliberately constrained. It should choose from known actions, create small query plans, filter already-materialized queue candidates, or select from real playlist candidates. It should not invent tracks as if it were a catalog.
 
-The resolver participates in three adaptive-session decisions:
+Saved preferences are stored and applied by Vesper itself, not exposed as resolver prompt context. For vague sessions the resolver can choose an abstract `preference` source, then `SessionEngine` materializes that source locally from liked tracks and favored artists.
+
+The resolver participates in these adaptive-session decisions:
 
 1. `plan_session` — produce one or more typed search sources for the next session step.
-2. `select_session_track` — choose an index from a small list of real track candidates.
-3. `select_session_playlist` / `rephrase_session_vibe` — handle playlist-oriented session searches and empty vibe searches.
+2. `select_session_playlist` / `rephrase_session_vibe` — handle playlist-oriented session searches and empty vibe searches.
+3. `filter_session_queue` — filter remaining materialized queue rows after steering.
 
 Resolver debug output can be enabled with `resolver_debug_log_path` plus the include flags documented in [configuration.md](configuration.md).
 
@@ -96,20 +98,19 @@ text request
   -> SessionEngine starts/updates a persisted session
   -> query planning creates typed search sources
   -> Apple Music searches return real candidates
-  -> SessionEngine builds an in-memory candidate pool
-  -> resolver selects from a small candidate window
+  -> SessionEngine materializes concrete queue rows in SQLite
   -> service plays the selected track through Cider
   -> worker advances the session when appropriate
 ```
 
 Session runtime is split between SQLite and in-memory state:
 
-- SQLite stores active sessions, steering history, selected tracks, session events, preferences, and persisted runtime fields.
-- In-memory runtime tracks process-local worker state, locks, cooldowns, active search sources, candidate pools, candidate cursors, and per-candidate state.
+- SQLite stores active sessions, steering history, selected tracks, session events, preferences, materialized session queue rows, and persisted runtime fields.
+- In-memory runtime tracks process-local worker state, locks, cooldowns, active search sources, cached query-pool metadata used during queue materialization, and the current queue item being played.
 
 The background worker is started by long-lived transports and reconciles stored session state on startup. CLI one-shot commands do not need a long-running server.
 
-See [Adaptive Sessions, Search, and Preferences](adaptive-sessions.md) for the practical behavior details: preference effects, typed search kinds, steering, where search results live, and how track selection works.
+See [Adaptive Sessions, Search, and Preferences](adaptive-sessions.md) for the practical behavior details: preference effects, typed search kinds, steering, where session queue rows live, and how track advancement works.
 
 ## Persistence
 

@@ -5,7 +5,7 @@ This directory contains the developer and integration documentation for Vesper. 
 ## Start Here
 
 - [Architecture](architecture.md) — the major components, request flow, persistence, and observability.
-- [Adaptive Sessions, Search, and Preferences](adaptive-sessions.md) — how sessions differ from one-track playback, how typed search sources work, what preferences do, where candidate pools live, and how steering/selection behave.
+- [Adaptive Sessions, Search, and Preferences](adaptive-sessions.md) — how sessions differ from one-track playback, how typed search sources work, what preferences do, where the materialized session queue lives, and how steering/advancement behave.
 - [Configuration](configuration.md) — config file lookup, environment variables, resolver settings, Cider, Historian, and storage.
 - [Transports](transports.md) — CLI, A2A, and MCP entrypoints and how they map onto the service layer.
 - [Development](development.md) — local setup, test commands, project layout, and change guidance.

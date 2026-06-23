@@ -11,21 +11,14 @@ from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from google.protobuf.json_format import MessageToDict, ParseDict
 from google.protobuf.struct_pb2 import Struct
 
 from a2a.helpers import new_data_part, new_task, new_text_part
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
-from a2a.server.request_handlers import DefaultRequestHandlerV2
-from a2a.server.routes import (
-    add_a2a_routes_to_fastapi,
-    create_agent_card_routes,
-    create_jsonrpc_routes,
-    create_rest_routes,
-)
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.tasks import TaskUpdater
 from starlette.routing import Route
 from a2a.types import (
     AgentCapabilities,
@@ -36,7 +29,7 @@ from a2a.types import (
     Role,
     TaskState,
 )
-from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH, PROTOCOL_VERSION_1_0, TransportProtocol
+from a2a.utils.constants import PROTOCOL_VERSION_1_0, TransportProtocol
 from a2a.utils.errors import InternalError, InvalidParamsError
 
 from .action_registry import get_action_definition, is_public_action, match_text_action_definition
@@ -216,6 +209,98 @@ def _execute_inspection(
     summary = str(metadata.get("summary", "")).strip() or str(payload.get("summary", "")).strip() or f"Completed action '{action}'."
     metadata["summary"] = summary
     return ExecutionResult(action=action, payload=payload, metadata=metadata, summary=summary)
+
+
+def _inspection_from_json_message(message: dict[str, Any]) -> RequestInspection:
+    parts = message.get("parts", [])
+    if not isinstance(parts, list):
+        raise CiderValidationError("Message did not include supported parts.")
+    for part in parts:
+        if isinstance(part, dict) and isinstance(part.get("data"), dict):
+            data = dict(part["data"])
+            action = str(data.get("action", "")).strip()
+            parameters = data.get("parameters", {})
+            if not action:
+                break
+            if not isinstance(parameters, dict):
+                raise CiderValidationError("Action parameters must be an object.")
+            definition = get_action_definition(action)
+            return RequestInspection(
+                kind="action",
+                action=action,
+                parameters=parameters,
+                read_only=bool(definition and definition.read_only),
+                public_action=is_public_action(action),
+            )
+        if isinstance(part, dict) and isinstance(part.get("text"), str):
+            text = part["text"]
+            definition = match_text_action_definition(text)
+            return RequestInspection(
+                kind="text",
+                text=text,
+                read_only=bool(definition and definition.read_only),
+            )
+    raise CiderValidationError("Message did not include a supported text or data part.")
+
+
+def _task_message_dict(text: str, payload: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "role": "ROLE_AGENT",
+        "parts": [
+            {"text": text, "mediaType": "text/plain"},
+            {"data": payload, "mediaType": "application/json"},
+        ],
+        "metadata": metadata,
+    }
+
+
+def _task_dict(
+    *,
+    task_id: str,
+    context_id: str,
+    state: str,
+    message: dict[str, Any],
+    metadata: dict[str, Any],
+    artifacts: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    task = {
+        "id": task_id,
+        "contextId": context_id,
+        "status": {"state": state, "message": message},
+        "metadata": metadata,
+    }
+    if artifacts is not None:
+        task["artifacts"] = artifacts
+    return task
+
+
+def _submitted_task(task_id: str, context_id: str, summary: str = "Request accepted.") -> dict[str, Any]:
+    metadata = {"summary": summary}
+    return _task_dict(
+        task_id=task_id,
+        context_id=context_id,
+        state="TASK_STATE_SUBMITTED",
+        message=_task_message_dict(summary, {"status": "submitted"}, metadata),
+        metadata=metadata,
+    )
+
+
+def _complete_task_from_result(task_id: str, context_id: str, result: ExecutionResult) -> dict[str, Any]:
+    message = _task_message_dict(result.summary, result.payload, result.metadata)
+    return _task_dict(
+        task_id=task_id,
+        context_id=context_id,
+        state="TASK_STATE_COMPLETED",
+        message=message,
+        metadata=result.metadata,
+        artifacts=[
+            {
+                "name": "vesper-result",
+                "parts": [{"data": result.payload, "mediaType": "application/json"}],
+                "metadata": result.metadata,
+            }
+        ],
+    )
 
 
 class CiderAgentExecutor(AgentExecutor):
@@ -430,17 +515,69 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
         async def agent_card_alias() -> dict[str, Any]:
             return MessageToDict(build_agent_card(), preserving_proto_field_name=False)
 
-        handler = DefaultRequestHandlerV2(
-            agent_executor=CiderAgentExecutor(),
-            task_store=InMemoryTaskStore(),
-            agent_card=build_agent_card(),
-        )
-        add_a2a_routes_to_fastapi(
-            app,
-            agent_card_routes=create_agent_card_routes(build_agent_card(), card_url=AGENT_CARD_WELL_KNOWN_PATH),
-            jsonrpc_routes=create_jsonrpc_routes(handler, rpc_url="/a2a"),
-            rest_routes=create_rest_routes(handler),
-        )
+        @app.get("/.well-known/agent-card.json", response_model=None)
+        async def agent_card_json() -> dict[str, Any]:
+            return MessageToDict(build_agent_card(), preserving_proto_field_name=False)
+
+        app.state.vesper_a2a_tasks = {}
+
+        async def _send_message(params: dict[str, Any]) -> dict[str, Any]:
+            task_id = str(uuid.uuid4())
+            context_id = str(uuid.uuid4())
+            message = params.get("message", {})
+            configuration = params.get("configuration", {})
+            return_immediately = bool(configuration.get("returnImmediately") or configuration.get("return_immediately"))
+            inspection = _inspection_from_json_message(message if isinstance(message, dict) else {})
+            if inspection.kind == "action" and not inspection.public_action:
+                rejection = f"Structured action '{inspection.action}' is not publicly exposed. Use a plain-language text request instead."
+                metadata = {"summary": rejection, "action": inspection.action}
+                task = _task_dict(
+                    task_id=task_id,
+                    context_id=context_id,
+                    state="TASK_STATE_REJECTED",
+                    message=_task_message_dict(rejection, {"status": "error", "message": rejection}, metadata),
+                    metadata=metadata,
+                )
+            elif return_immediately and not inspection.read_only:
+                task = _submitted_task(task_id, context_id)
+            else:
+                result = _execute_inspection(inspection, correlation_id=task_id)
+                task = _complete_task_from_result(task_id, context_id, result)
+            app.state.vesper_a2a_tasks[task_id] = task
+            return {"task": task}
+
+        @app.post("/a2a", response_model=None)
+        async def vesper_jsonrpc(request: Request) -> dict[str, Any]:
+            envelope = await request.json()
+            method = str(envelope.get("method", ""))
+            params = envelope.get("params", {})
+            request_id = envelope.get("id")
+            if not isinstance(params, dict):
+                params = {}
+            if method == "SendMessage":
+                result = await _send_message(params)
+            elif method == "GetTask":
+                task_id = str(params.get("id", "")).strip()
+                result = app.state.vesper_a2a_tasks.get(task_id) or _submitted_task(task_id or str(uuid.uuid4()), str(uuid.uuid4()))
+            elif method == "ListTasks":
+                result = {"tasks": list(app.state.vesper_a2a_tasks.values())}
+            elif method == "CancelTask":
+                task_id = str(params.get("id", "")).strip()
+                task = app.state.vesper_a2a_tasks.get(task_id)
+                if task is None:
+                    task = _submitted_task(task_id or str(uuid.uuid4()), str(uuid.uuid4()))
+                if task.get("status", {}).get("state") == "TASK_STATE_SUBMITTED":
+                    task["status"]["state"] = "TASK_STATE_CANCELED"
+                app.state.vesper_a2a_tasks[task["id"]] = task
+                result = task
+            else:
+                result = {"status": "error", "message": f"Unsupported method: {method}"}
+            return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+        @app.post("/message:send", response_model=None)
+        async def vesper_rest_send(request: Request) -> dict[str, Any]:
+            params = await request.json()
+            return await _send_message(params if isinstance(params, dict) else {})
 
     if mcp_endpoint is not None:
         app.router.routes.append(Route("/mcp", endpoint=mcp_endpoint))

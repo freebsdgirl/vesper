@@ -37,6 +37,28 @@ def test_cli_ask_calls_service_directly(monkeypatch, capsys) -> None:
     assert json.loads(captured.out)["input"] == "play some kep1er"
 
 
+def test_cli_session_queue_calls_service(monkeypatch, capsys) -> None:
+    class FakeService:
+        def session_queue(self, *, limit: int, include_history: bool):
+            return {
+                "status": "ok",
+                "limit": limit,
+                "include_history": include_history,
+                "items": [{"title": "Queued"}],
+            }
+
+    monkeypatch.setattr(cli, "get_service", lambda: FakeService())
+    monkeypatch.setattr("sys.argv", ["vesper", "--json", "session", "queue", "--limit", "7", "--all"])
+
+    cli.main()
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["limit"] == 7
+    assert payload["include_history"] is True
+    assert payload["items"][0]["title"] == "Queued"
+
+
 def test_cli_prints_text_request_errors(monkeypatch, capsys) -> None:
     class FakeService:
         def handle_text_request(self, text: str):

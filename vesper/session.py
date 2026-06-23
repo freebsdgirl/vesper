@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from .errors import CiderValidationError
 from .output import compact_output
-from .resolver import SessionQueryPlan, SessionSearchSource, SessionTrackSelection
+from .resolver import SessionQueryPlan, SessionQueueDecision, SessionSearchSource, SessionTrackSelection
 from .service import (
     _clean_id,
     _elapsed_ms,
@@ -192,6 +192,7 @@ class SessionEngine:
         self._session_runtime: dict[int, dict[str, Any]] = {}
         self._session_advance_lock = threading.Lock()
         self._random = random.SystemRandom()
+        self._session_queue_batch_size = 20
         self._debug_candidate_track_search_count = 0
         self._debug_candidate_track_search_ms = 0.0
         self._debug_candidate_artist_search_count = 0
@@ -228,7 +229,10 @@ class SessionEngine:
             preserve_last_advance=True,
         )
         if playback.get("is_playing"):
+            self._restore_current_queue_item_runtime(session["id"], playback=playback)
             self._record_current_track_for_session(session, playback=playback, event_type="track_started")
+        else:
+            self._preferences.reset_stale_session_queue_items(session["id"])
 
     def start_background_session_worker(self) -> None:
         with self._session_worker_lock:
@@ -285,6 +289,22 @@ class SessionEngine:
         if compact is True or self._host.response_detail() == "compact":
             return compact_output(payload, self._host.include_timing_debug())
         return payload
+
+    def session_queue(self, *, limit: int = 50, include_history: bool = False) -> dict[str, Any]:
+        session = self._preferences.get_active_session()
+        if session is None:
+            return {"status": "ok", "session": None, "count": 0, "items": []}
+        items = self._preferences.list_session_queue(
+            session["id"],
+            limit=limit,
+            include_history=include_history,
+        )
+        return {
+            "status": "ok",
+            "session": session,
+            "count": len(items),
+            "items": items,
+        }
 
     def recent_session_tracks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         session = self._preferences.get_active_session()
@@ -397,11 +417,15 @@ class SessionEngine:
         self._set_session_runtime(session["id"], suspended=False, active_search_sources=self._host._sources_payload(next_sources))
         if resolved_search_update["mode"] == "replace" and next_sources != current_sources:
             self._replace_session_query_pools(session, next_sources)
+            self._materialize_session_queue(session, next_sources, queue_policy="source_order", preserve_history=True)
         elif resolved_search_update["mode"] == "add":
             current_keys = {self._session_source_key(source) for source in current_sources}
             added_sources = [source for source in next_sources if self._session_source_key(source) not in current_keys]
             if added_sources:
                 self._ensure_session_query_pools(session, added_sources)
+                self._append_session_sources_to_queue(session, added_sources, queue_policy="source_order")
+        else:
+            self._filter_remaining_session_queue(session)
         self._persist_session_runtime(session["id"], suspended=False, last_known_playback_state="playing")
         self._preferences.add_session_event(
             session["id"],
@@ -601,7 +625,17 @@ class SessionEngine:
                 timings["plan_session_ms"] = _elapsed_ms(planning_started_at)
                 self._check_worker_cancelled()
                 collect_started_at = time.perf_counter()
-                tracks, search_source, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                self._ensure_materialized_session_queue(session, plan)
+                if self._host.include_timing_debug():
+                    self._copy_queue_materialization_timings(timings)
+                self._check_worker_cancelled()
+                tracks, search_source, selection, queue_item = self._claim_session_queue_track(session)
+                if not tracks:
+                    self._ensure_materialized_session_queue(session, plan)
+                    if self._host.include_timing_debug():
+                        self._copy_queue_materialization_timings(timings)
+                    self._check_worker_cancelled()
+                    tracks, search_source, selection, queue_item = self._claim_session_queue_track(session)
                 if not tracks and getattr(plan, "resolver", "") != "preference-seeded":
                     self._check_worker_cancelled()
                     self._reject_session_plan_sources(session["id"], plan)
@@ -609,7 +643,11 @@ class SessionEngine:
                     plan = self._plan_session_query(session, count=1, force_replan=True)
                     timings["replan_session_ms"] = _elapsed_ms(replan_started_at)
                     collect_retry_started_at = time.perf_counter()
-                    tracks, search_source, selection = self._collect_session_tracks(session, plan, limit=1, timings=timings)
+                    self._ensure_materialized_session_queue(session, plan)
+                    if self._host.include_timing_debug():
+                        self._copy_queue_materialization_timings(timings)
+                    self._check_worker_cancelled()
+                    tracks, search_source, selection, queue_item = self._claim_session_queue_track(session)
                     timings["collect_retry_ms"] = _elapsed_ms(collect_retry_started_at)
                 timings["collect_tracks_ms"] = _elapsed_ms(collect_started_at)
                 if not tracks:
@@ -619,6 +657,8 @@ class SessionEngine:
                 self._check_worker_cancelled()
                 play_started_at = time.perf_counter()
                 playback_result = self._host._play_flattened_track(lead_track, is_library_default=False)
+                if queue_item is not None:
+                    self._preferences.mark_session_queue_item(queue_item["id"], "playing")
                 timings["play_track_ms"] = _elapsed_ms(play_started_at)
                 record_selected_started_at = time.perf_counter()
                 self._preferences.add_session_track(session["id"], lead_track)
@@ -648,6 +688,7 @@ class SessionEngine:
                     last_advance_at=self._host.current_timestamp(),
                     last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
                     last_known_playback_state="playing",
+                    current_queue_item_id=queue_item.get("id") if isinstance(queue_item, dict) else None,
                     planning_playback_snapshot=None,
                 )
                 self._persist_session_runtime(
@@ -684,13 +725,7 @@ class SessionEngine:
         runtime = self._get_session_runtime(session["id"])
         active_sources = self._normalize_search_sources(runtime.get("active_search_sources"))
         if active_sources and not force_replan:
-            self._ensure_session_query_pools(session, active_sources)
             return SessionQueryPlan(search_sources=active_sources[:count] or active_sources, resolver="session-runtime")
-        if self._is_vague_play_request(session.get("request_text")):
-            seeded_sources = self._bootstrap_preference_seeded_session(session)
-            if seeded_sources:
-                self._set_session_runtime(session["id"], active_search_sources=self._host._sources_payload(seeded_sources))
-                return SessionQueryPlan(search_sources=seeded_sources[:count] or seeded_sources, resolver="preference-seeded")
         planner = getattr(self._host._resolver, "plan_session", None)
         if not callable(planner):
             raise CiderValidationError("The configured resolver does not support adaptive play sessions.")
@@ -708,6 +743,7 @@ class SessionEngine:
         normalized_plan = SessionQueryPlan(
             search_sources=resolved_sources,
             resolver=getattr(plan, "resolver", "unknown"),
+            queue_policy=self._normalize_queue_policy(getattr(plan, "queue_policy", "source_order")),
             raw=getattr(plan, "raw", None),
             reasoning=getattr(plan, "reasoning", None),
             raw_content=getattr(plan, "raw_content", None),
@@ -719,6 +755,10 @@ class SessionEngine:
                 query_pools={},
             )
         return normalized_plan
+
+    def _normalize_queue_policy(self, value: Any) -> str:
+        policy = str(value or "source_order").strip().lower()
+        return policy if policy in {"source_order", "shuffle"} else "source_order"
 
     def _session_effective_request(self, session: dict[str, Any]) -> str:
         steering = session.get("steering_history", [])
@@ -753,6 +793,214 @@ class SessionEngine:
             )
 
         return chosen, search_source, selection
+
+    def _ensure_materialized_session_queue(self, session: dict[str, Any], plan: SessionQueryPlan) -> None:
+        existing = self._preferences.list_session_queue(session["id"], limit=1)
+        if existing:
+            return
+        sources = self._plan_search_sources(plan)
+        self._materialize_session_queue(
+            session,
+            sources,
+            queue_policy=self._normalize_queue_policy(getattr(plan, "queue_policy", "source_order")),
+        )
+
+    def _copy_queue_materialization_timings(self, timings: dict[str, Any]) -> None:
+        timings["candidate_track_search_count"] = getattr(self, "_debug_candidate_track_search_count", 0)
+        timings["candidate_track_search_ms"] = round(getattr(self, "_debug_candidate_track_search_ms", 0.0), 2)
+        timings["candidate_artist_search_count"] = getattr(self, "_debug_candidate_artist_search_count", 0)
+        timings["candidate_artist_search_ms"] = round(getattr(self, "_debug_candidate_artist_search_ms", 0.0), 2)
+        timings["candidate_query_search_count"] = getattr(self, "_debug_candidate_query_search_count", 0)
+        timings["candidate_query_search_ms"] = round(getattr(self, "_debug_candidate_query_search_ms", 0.0), 2)
+        timings["selection_candidate_count"] = 0
+
+    def _materialize_session_queue(
+        self,
+        session: dict[str, Any],
+        search_sources: list[SessionSearchSource],
+        *,
+        queue_policy: str,
+        preserve_history: bool = False,
+    ) -> None:
+        queue_items = self._queue_items_for_sources(session, search_sources)
+        queue_items = self._apply_queue_policy(queue_items, queue_policy)
+        self._preferences.replace_session_queue(
+            session["id"],
+            queue_items,
+            preserve_history=preserve_history,
+        )
+        self._set_session_runtime(
+            session["id"],
+            active_search_sources=self._host._sources_payload(self._normalize_search_sources(search_sources)),
+        )
+        self._host.append_session_debug_log(
+            stage="session_queue_materialized",
+            payload={
+                "session_id": session.get("id"),
+                "queue_policy": queue_policy,
+                "queue_count": len(queue_items),
+                "sources": self._host._sources_payload(self._normalize_search_sources(search_sources)),
+            },
+        )
+
+    def _append_session_sources_to_queue(
+        self,
+        session: dict[str, Any],
+        search_sources: list[SessionSearchSource],
+        *,
+        queue_policy: str,
+    ) -> None:
+        queue_items = self._apply_queue_policy(self._queue_items_for_sources(session, search_sources), queue_policy)
+        self._preferences.append_session_queue(session["id"], queue_items)
+        self._host.append_session_debug_log(
+            stage="session_queue_appended",
+            payload={
+                "session_id": session.get("id"),
+                "queue_policy": queue_policy,
+                "queue_count": len(queue_items),
+                "sources": self._host._sources_payload(self._normalize_search_sources(search_sources)),
+            },
+        )
+
+    def _queue_items_for_sources(
+        self,
+        session: dict[str, Any],
+        search_sources: list[SessionSearchSource],
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        runtime = self._get_session_runtime(session["id"])
+        pools: dict[str, dict[str, Any]] = self._normalize_session_query_pools(runtime.get("query_pools"))
+        for source in self._normalize_search_sources(search_sources):
+            if source.kind == "preference":
+                self._bootstrap_preference_seeded_session(session)
+                runtime = self._get_session_runtime(session["id"])
+                pools = self._normalize_session_query_pools(runtime.get("query_pools"))
+                pool = pools.get(self._session_source_key(source)) or {
+                    "source": {"kind": source.kind, "term": source.term},
+                    "entries": [],
+                }
+            else:
+                pool = self._build_session_query_pool(session, source)
+            source_payload = {"kind": source.kind, "term": source.term}
+            source_key = self._session_source_key(source)
+            pools[source_key] = pool
+            for entry in pool.get("entries", []):
+                track = dict(entry.get("track") or {})
+                track_id = _clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id"))
+                if not track_id or track_id in seen_ids:
+                    continue
+                seen_ids.add(track_id)
+                items.append({"source": source_payload, "source_key": source_key, "track": track})
+        if pools:
+            self._set_session_runtime(session["id"], query_pools=pools)
+        return items
+
+    def _apply_queue_policy(self, queue_items: list[dict[str, Any]], queue_policy: str) -> list[dict[str, Any]]:
+        items = list(queue_items)
+        if self._normalize_queue_policy(queue_policy) == "shuffle":
+            self._random.shuffle(items)
+        return items
+
+    def _claim_session_queue_track(
+        self,
+        session: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], SessionSearchSource, SessionTrackSelection, dict[str, Any] | None]:
+        self._mark_current_queue_item_played(session["id"])
+        queue_item = self._preferences.claim_next_session_queue_item(session["id"])
+        if queue_item is None:
+            return [], SessionSearchSource(kind="vibe", term=""), SessionTrackSelection(selected_index=0, resolver="queue"), None
+        source_values = queue_item.get("source")
+        sources = self._normalize_search_sources([source_values] if isinstance(source_values, dict) else [])
+        source = sources[0] if sources else SessionSearchSource(kind="vibe", term=str(queue_item.get("source_term") or ""))
+        track = dict(queue_item.get("track") or {})
+        track.setdefault("id", queue_item.get("track_id"))
+        track.setdefault("title", queue_item.get("title"))
+        track.setdefault("artist", queue_item.get("artist"))
+        track.setdefault("album", queue_item.get("album"))
+        track.setdefault("href", queue_item.get("href"))
+        self._set_session_runtime(
+            session["id"],
+            current_pool_query=queue_item.get("source_key") or source.term,
+            current_seed_query=str(track.get("_seed_query", "")).strip() or source.term,
+            current_track_id=_clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id")),
+        )
+        return [track], source, SessionTrackSelection(selected_index=0, resolver="session-queue"), queue_item
+
+    def _mark_current_queue_item_played(self, session_id: int) -> None:
+        runtime = self._get_session_runtime(session_id)
+        queue_item_id = runtime.get("current_queue_item_id")
+        if isinstance(queue_item_id, int):
+            self._preferences.mark_session_queue_item(queue_item_id, "played")
+            self._set_session_runtime(session_id, current_queue_item_id=None)
+
+    def _restore_current_queue_item_runtime(self, session_id: int, *, playback: dict[str, Any]) -> None:
+        current = playback.get("track", {})
+        current_track_id = _clean_id(current.get("track_id")) if isinstance(current, dict) else ""
+        if not current_track_id:
+            return
+        for item in self._preferences.list_session_queue(session_id, limit=25, include_history=True):
+            if item.get("state") != "playing":
+                continue
+            if _clean_id(item.get("track_id")) != current_track_id:
+                continue
+            self._set_session_runtime(session_id, current_queue_item_id=item["id"])
+            return
+
+    def _filter_remaining_session_queue(self, session: dict[str, Any]) -> None:
+        remaining = self._preferences.list_session_queue(session["id"], limit=1000)
+        if not remaining:
+            return
+        kept_items: list[dict[str, Any]] = []
+        resolved_policy = "source_order"
+        chooser = getattr(self._host._resolver, "filter_session_queue", None)
+        for start in range(0, len(remaining), self._session_queue_batch_size):
+            batch = remaining[start : start + self._session_queue_batch_size]
+            candidates = [dict(item.get("track") or {}) for item in batch]
+            decision = (
+                chooser(self._session_effective_request(session), self._host, session, candidates)
+                if callable(chooser)
+                else SessionQueueDecision(eligible_indices=list(range(len(batch))), resolver="fallback")
+            )
+            eligible = self._normalize_eligible_indices(getattr(decision, "eligible_indices", []), len(batch))
+            resolved_policy = self._normalize_queue_policy(getattr(decision, "queue_policy", resolved_policy))
+            for index in eligible:
+                item = batch[index]
+                kept_items.append(
+                    {
+                        "source": item.get("source"),
+                        "source_key": item.get("source_key"),
+                        "track": item.get("track"),
+                    }
+                )
+        self._preferences.replace_session_queue(
+            session["id"],
+            self._apply_queue_policy(kept_items, resolved_policy),
+            preserve_history=True,
+        )
+        self._host.append_session_debug_log(
+            stage="session_queue_filtered",
+            payload={
+                "session_id": session.get("id"),
+                "input_count": len(remaining),
+                "output_count": len(kept_items),
+                "queue_policy": resolved_policy,
+            },
+        )
+
+    def _normalize_eligible_indices(self, value: Any, candidate_count: int) -> list[int]:
+        if not isinstance(value, list):
+            return list(range(candidate_count))
+        indices: list[int] = []
+        seen: set[int] = set()
+        for item in value:
+            if not isinstance(item, int):
+                continue
+            if item < 0 or item >= candidate_count or item in seen:
+                continue
+            seen.add(item)
+            indices.append(item)
+        return indices
 
     def _collect_session_tracks_from_pools(
         self,
@@ -1228,24 +1476,6 @@ class SessionEngine:
             artist_counts[artist_key] = artist_counts.get(artist_key, 0) + 1
         return True
 
-    def _is_vague_play_request(self, value: Any) -> bool:
-        text = str(value or "").strip().casefold()
-        if not text:
-            return False
-        compact = re.sub(r"[^a-z0-9]+", " ", text)
-        compact = " ".join(compact.split())
-        vague_patterns = {
-            "play music",
-            "play some music",
-            "play some songs",
-            "play something",
-            "play something good",
-            "play anything",
-            "some music",
-            "music please",
-        }
-        return compact in vague_patterns
-
     def _current_preference_context_query(self, runtime: dict[str, Any]) -> str | None:
         for key in ("current_seed_query", "current_pool_query"):
             value = str(runtime.get(key, "")).strip()
@@ -1659,7 +1889,9 @@ class SessionEngine:
         )
 
     def _mark_session_track_rejected(self, session_id: int, track_id: str) -> None:
+        self._preferences.mark_session_queue_track(session_id, track_id, "rejected")
         runtime = self._get_session_runtime(session_id)
+        self._set_session_runtime(session_id, current_queue_item_id=None)
         pools = self._normalize_session_query_pools(runtime.get("query_pools"))
         preferred_query = str(runtime.get("current_pool_query", "")).strip()
         ordered_queries = [preferred_query] if preferred_query else []
@@ -1722,12 +1954,50 @@ class SessionEngine:
             return False
         if runtime.get("advance_in_progress"):
             return False
-        if playback.get("is_playing"):
+        is_playing = playback.get("is_playing")
+        if is_playing is True:
+            return False
+        if is_playing is not False:
+            return False
+        if self._playback_has_unfinished_current_track(playback):
             return False
         elapsed = self._seconds_since_runtime_timestamp(runtime.get("last_advance_at"))
         if elapsed is not None and elapsed < self._host.SESSION_ADVANCE_COOLDOWN_SECONDS:
             return False
         return True
+
+    def _playback_has_unfinished_current_track(self, playback: dict[str, Any]) -> bool:
+        track = playback.get("track", {})
+        if not isinstance(track, dict):
+            return False
+        if not _clean_id(track.get("track_id")):
+            return False
+        remaining = self._numeric_value(track.get("remaining_time"))
+        if remaining is not None:
+            return remaining > 1.0
+        current = self._numeric_value(track.get("current_playback_time"))
+        duration = self._numeric_value(track.get("duration_millis"))
+        if current is not None and duration is not None and duration > 0:
+            duration_seconds = duration / 1000.0 if duration > 1000 else duration
+            current_seconds = current / 1000.0 if current > duration_seconds + 5 and current <= duration + 5 else current
+            return current_seconds < duration_seconds - 1.0
+        # Cider may briefly report is-playing false while still exposing the
+        # current track during startup/buffering. Treat that as not advanceable
+        # unless timing data proves the track has ended.
+        return True
+
+    def _numeric_value(self, value: Any) -> float | None:
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                return float(stripped)
+            except ValueError:
+                return None
+        return None
 
     def _effective_session_runtime(self, session_id: int) -> dict[str, Any]:
         runtime = self._get_session_runtime(session_id)
@@ -1852,4 +2122,3 @@ class SessionEngine:
             },
             metadata={"selection_strategy": selection_strategy},
         )
-

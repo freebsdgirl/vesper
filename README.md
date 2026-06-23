@@ -85,7 +85,7 @@ Structured actions exist, but the public surface is intentionally tiny: `play`, 
 The README is only the front door. The deeper docs live in [`docs/`](docs/README.md):
 
 - [Architecture](docs/architecture.md) explains the service, resolver, persistence, and event flow.
-- [Adaptive Sessions, Search, and Preferences](docs/adaptive-sessions.md) explains preferences, typed search sources, sessions vs. one-track playback, candidate pools, steering, and track selection.
+- [Adaptive Sessions, Search, and Preferences](docs/adaptive-sessions.md) explains preferences, typed search sources, sessions vs. one-track playback, the materialized session queue, steering, and track advancement.
 - [Configuration](docs/configuration.md) covers config files, environment overrides, resolver settings, Cider, Historian, and storage.
 - [Transports](docs/transports.md) documents CLI, A2A, and MCP behavior.
 - [Development](docs/development.md) explains the local workflow, tests, and where common changes belong.

@@ -34,6 +34,12 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("mcp")
 
+    session = subparsers.add_parser("session")
+    session_subparsers = session.add_subparsers(dest="session_command", required=True)
+    session_queue = session_subparsers.add_parser("queue")
+    session_queue.add_argument("--limit", type=int, default=50)
+    session_queue.add_argument("--all", action="store_true", help="Include played, rejected, and filtered queue history.")
+
     preferences = subparsers.add_parser("preferences")
     preferences_subparsers = preferences.add_subparsers(dest="preferences_command", required=True)
     preferences_subparsers.add_parser("list")
@@ -84,6 +90,11 @@ def main() -> None:
                 payload = service.stop()
             elif args.command == "ask":
                 payload = service.handle_text_request(args.text)
+            elif args.command == "session":
+                if args.session_command == "queue":
+                    payload = service.session_queue(limit=args.limit, include_history=args.all)
+                else:  # pragma: no cover - argparse enforces commands
+                    raise RuntimeError(f"Unhandled session command: {args.session_command}")
             elif args.command == "preferences":
                 if args.preferences_command == "list":
                     payload = service.list_preferences()

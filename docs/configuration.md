@@ -116,7 +116,7 @@ Useful debug options:
 }
 ```
 
-Keep raw output logging disabled unless you need it; resolver logs can contain request text, candidate tracks, and model responses.
+Keep raw output logging disabled unless you need it; resolver logs can contain request text, playback summaries, candidate tracks, and model responses. Saved preference rows are not included in the `resolve_text_request` or `plan_session_query` prompt context; preference-seeded sessions use those rows locally after the resolver chooses the abstract `preference` source.
 
 ## HTTP Settings
 

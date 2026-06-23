@@ -16,6 +16,8 @@ vesper ask "play some music"
 vesper ask "what's playing?"
 vesper preferences list
 vesper preferences forget 12
+vesper session queue --json
+vesper session queue --all --limit 100 --json
 ```
 
 Use `--json` to print the full payload instead of the default result-focused view:
@@ -25,6 +27,8 @@ vesper --json ask "play some music"
 ```
 
 CLI commands call the service directly in the current process. They do not require `vesper serve` to be running.
+
+`vesper session queue` inspects Vesper's persisted adaptive-session queue, not Cider's native playback queue. By default it shows queued/playing rows; `--all` includes played, rejected, and filtered history.
 
 ## HTTP Serving
 

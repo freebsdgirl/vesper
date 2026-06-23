@@ -23,7 +23,7 @@ Current preference types:
 
 - `liked_track` — a track the user explicitly liked.
 - `favored_artist` — the artist of a liked track, recorded so future vague sessions can seed from that artist.
-- `globally_rejected_track` — a track the user explicitly rejected; future session candidate pools filter these out.
+- `globally_rejected_track` — a track the user explicitly rejected; future session queue materialization filters these out.
 
 ### Does “I like this” save a preference?
 
@@ -51,9 +51,11 @@ If the fallback resolver is the only resolver, broad phrases like `i like this` 
 Preferences are used in two main ways:
 
 1. **Vague-session seeding.** Requests like `play some music` can bootstrap from saved preference cues before asking the resolver to invent a new search direction. Vesper uses liked tracks' previous session queries, favored artists, and liked tracks as seeds.
-2. **Avoidance.** Globally rejected tracks are excluded from future session candidate pools.
+2. **Avoidance.** Globally rejected tracks are excluded from future session queue rows.
 
 Preferences do not currently act like a global recommender profile for every possible search. They are most important for vague session starts and repeat/rejection avoidance.
+
+Saved preference rows stay local to Vesper's service/storage layer. The OpenAI-compatible resolver may be told that an abstract `preference` source is available for extremely vague sessions, but Vesper does not send the actual saved preference list in `resolve_text_request` or `plan_session_query` prompt context.
 
 View preferences with:
 
@@ -83,8 +85,15 @@ Internal/transitional kinds:
 
 | Kind | Purpose |
 | --- | --- |
-| `preference` | Synthetic source used for preference-seeded vague sessions. It is backed by an in-memory pool built from liked tracks, favored artists, and preference cues. |
+| `preference` | Synthetic source used for preference-seeded vague sessions. Vesper materializes it locally from liked tracks, favored artists, and preference cues. |
 | `legacy` | Compatibility source for older resolver output that only returned query strings. It behaves like catalog track search. |
+
+The planner can also return `queue_policy`:
+
+| Policy | Meaning |
+| --- | --- |
+| `source_order` | Keep the materialized queue in the order produced by the source lookup. This is the default. |
+| `shuffle` | Shuffle the concrete queue rows after materialization. |
 
 ## How the LLM Chooses Search Types
 
@@ -93,7 +102,6 @@ For adaptive-session planning, the OpenAI-compatible resolver receives:
 - the original session request;
 - recent session steering;
 - compact playback state;
-- a small preference sample;
 - supported Apple Music genre names;
 - rejected search sources;
 - the current timestamp.
@@ -103,11 +111,14 @@ Its planning instruction is constrained:
 - use `artist` for artist names;
 - use `genre` only for exact supported genre names;
 - use `vibe` for moods, activities, unsupported subgenres, descriptive requests, and genre-plus-mood requests;
+- use `preference` only as an abstract source for extremely vague requests;
 - preserve concrete user descriptors instead of unnecessarily narrowing them;
 - use creative interpretation mainly for open-ended/contextual/activity requests;
 - do not invent final tracks.
 
-The resolver returns only the source. Vesper performs the real Apple Music lookup.
+The resolver returns only the source. Vesper performs the real Apple Music lookup. If the source is `preference`, Vesper locally builds the pool from saved likes and favored artists without exposing those saved preference rows to the resolver.
+
+The planner does not choose the next track during normal session advances. It chooses a source, and Vesper materializes that source into concrete persisted queue rows. Later advances claim the next eligible row from SQLite.
 
 ## Is the User's Search Used Verbatim?
 
@@ -131,33 +142,46 @@ Examples:
 
 There is not currently a user-facing “verbatim adaptive session” switch. If you need exact search behavior, use direct search/play-search functionality rather than starting an adaptive session.
 
-## Where Session Search Results Live
+## Where Session Queue Items Live
 
-When a session plans a source, Vesper builds a **query pool** for that source:
+When a session plans a source, Vesper now builds a **materialized session queue**:
 
 ```text
-search source -> Apple Music lookup -> ordered candidate tracks -> in-memory query pool
+search source -> Apple Music lookup -> filtered candidate tracks -> SQLite session queue
 ```
 
-A query pool contains:
+A session queue item contains:
 
 - the source `{kind, term}`;
-- optional resolved resource metadata, such as artist ID, genre ID, playlist ID, or resolved name;
-- an ordered list of candidate tracks;
-- a cursor;
-- per-track state: `fresh`, `played`, `screened_out`, or `rejected`.
+- the flattened Apple Music track payload needed for playback;
+- its concrete queue position;
+- state such as `queued`, `playing`, `played`, `rejected`, `filtered`, or `failed`.
 
-Important: full candidate pools are process-local runtime state. They are not stored in SQLite.
+The queue is Vesper's own adaptive-session queue. It is persisted in SQLite and is separate from Cider's native playback queue.
+
+Queue rows move through these states:
+
+| State | Meaning |
+| --- | --- |
+| `queued` | Eligible for a future session advance. |
+| `playing` | Claimed by Vesper and handed to Cider for playback. |
+| `played` | Previously playing and superseded by a later session advance. |
+| `rejected` | Rejected by the user or marked unavailable for the session. |
+| `filtered` | Removed from the future queue by steering/filtering while retained as history. |
+| `failed` | Reserved for rows that could not be played. |
 
 SQLite stores durable session data such as:
 
 - sessions and steering history;
+- materialized session queue rows;
 - selected session tracks;
 - session events;
 - minimal persisted runtime fields like active/suspended intent, last advance time, last selected track ID, and last known playback state;
 - preferences.
 
-Because candidate pools are not persisted, restarting the service can require rebuilding pools from the active session's request/steering rather than resuming the exact candidate list.
+Because the future queue is persisted, restarting the service can inspect and continue the same planned queue instead of reconstructing future choices from process-local state.
+
+On startup, Vesper reconciles persisted queue state with current Cider playback. If Cider is still playing the row marked `playing`, the service restores that queue item into runtime state. If playback is stopped, stale `playing` rows are reset so they can be claimed again.
 
 ## Can You View the Search Results or Queue?
 
@@ -165,11 +189,16 @@ There are three different things people might call “the queue”:
 
 1. **Cider's native queue** — visible through Vesper's `get_queue` action / `what is the queue?` if the resolver maps it there. This is Cider's playback queue.
 2. **Session recent tracks** — selected session tracks persisted in SQLite and shown by `session_status`.
-3. **Session candidate pools** — in-memory candidate lists used for future adaptive choices.
+3. **Vesper's session queue** — the concrete future adaptive-session items persisted by Vesper.
 
-Currently, there is no stable public command that dumps the full in-memory session candidate pool. Candidate windows and pool summaries can appear in session debug logs if debug logging is enabled in code/config, but the user-facing status focuses on the active session and recent selected tracks.
+Use the developer CLI path to inspect Vesper's session queue:
 
-This means: `get_queue` is not the same as “show me every candidate Vesper found for this session.” Vesper usually plays selected tracks directly rather than enqueueing the whole pool into Cider.
+```sh
+vesper session queue --json
+vesper session queue --all --limit 100 --json
+```
+
+This means: `get_queue` is not the same as “show me every future Vesper session item.” Vesper usually plays selected tracks directly rather than enqueueing the whole session queue into Cider.
 
 ## What Happens After a Session Starts?
 
@@ -179,28 +208,40 @@ Starting a session does this:
 2. create a new active session row in SQLite;
 3. clear Cider's queue;
 4. plan or seed a search source;
-5. build an in-memory candidate pool;
-6. show the resolver a small candidate window;
-7. play the selected track directly through Cider;
+5. build and persist a concrete session queue;
+6. claim the first queued item;
+7. play the claimed track directly through Cider;
 8. record the selected track in SQLite;
-9. keep the session active for later advances.
+9. keep the remaining queue active for later advances.
 
 The session does **not** enqueue every candidate and play them in order.
 
-Instead, each advance repeats the selection loop:
+Instead, each advance uses the materialized queue:
 
 ```text
-active source pool
-  -> next fresh sequential window, up to SESSION_SELECTION_WINDOW_SIZE
-  -> resolver chooses selected_index, or -1 for none suitable
-  -> chosen track is marked played and played directly
-  -> if the whole window is unsuitable, it is marked screened_out
-  -> cursor advances past the shown window
+persisted session queue
+  -> mark the previous playing item played
+  -> claim the next queued item
+  -> play it directly
+  -> record selection and playback state
 ```
 
-The pool itself is ordered by the Apple Music result/relationship order. Vesper walks it sequentially to create windows. The resolver chooses within each small window; it does not see the entire pool at once.
+Normal advance does not call the resolver. If the queue is exhausted, Vesper may rebuild from the active planned source; richer automatic queue-extension policies can be layered on separately.
 
-When no fresh tracks remain, Vesper may reset `screened_out` tracks first, then `played` tracks. `rejected` tracks are not reset inside the same pool.
+The auto-advance worker is intentionally conservative. It advances only when playback state is explicitly stopped, cooldown has elapsed, and the current playback snapshot does not show an unfinished track.
+
+## Resolver Calls During a Session
+
+The materialized queue changes when the resolver is consulted:
+
+| Hook | When it runs | What it decides |
+| --- | --- | --- |
+| `plan_session` | Session start, forced replans, or empty queue rebuilds. | Typed search sources and optional `queue_policy`. |
+| `select_session_playlist` | While building `vibe` queue rows from playlist search results. | Which real Apple Music playlist to use for the source. |
+| `rephrase_session_vibe` | When a `vibe` source returns no usable playlist/track results. | A fallback search phrase. |
+| `filter_session_queue` | Steering with preserved sources, in batches of remaining queue rows. | Which existing queued rows remain eligible and whether to apply a queue policy. |
+
+Normal queue advancement does **not** call `select_session_track`. The old per-advance candidate-window selection path has been replaced by claiming materialized rows. This keeps the future session queue inspectable and stable across process restarts.
 
 ## Mid-Session Steering
 
@@ -219,8 +260,9 @@ When steering runs, Vesper:
 1. appends the steering text to the session's persisted steering history;
 2. normalizes an optional `search_update` from the resolver;
 3. updates active search sources according to the mode;
-4. records a `session_steered` event;
-5. usually defers audible change until the next track.
+4. filters or rebuilds the remaining materialized queue;
+5. records a `session_steered` event;
+6. usually defers audible change until the next track.
 
 `search_update.mode` can be:
 
@@ -228,9 +270,9 @@ When steering runs, Vesper:
 | --- | --- |
 | `preserve` | Keep current active search sources. The steering text still affects future resolver choices because it is included in selection/planning context. |
 | `add` | Add new typed sources alongside existing sources. |
-| `replace` | Replace active sources and rebuild query pools for the new direction. |
+| `replace` | Replace active sources and rebuild the materialized queue for the new direction. |
 
-For a request like `prefer female vocalists`, the resolver may simply preserve the current source and rely on the selection prompt to prefer matching candidates, or it may add/replace sources if it can express the steering as an `artist`, `genre`, or `vibe` source. The exact choice depends on resolver output.
+For a request like `prefer female vocalists`, the resolver may preserve the current source and filter the remaining queue, or it may add/replace sources if it can express the steering as an `artist`, `genre`, or `vibe` source. The exact choice depends on resolver output.
 
 Steering is cumulative. Resolver prompts tell the model to treat steering as persistent session state, not a one-turn hint, until explicitly overridden.
 

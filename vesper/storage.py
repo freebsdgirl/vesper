@@ -156,6 +156,40 @@ class PreferenceStore:
                 ON session_events(session_id, created_at DESC, id DESC)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS session_queue_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id INTEGER NOT NULL,
+                    position INTEGER NOT NULL,
+                    source_kind TEXT,
+                    source_term TEXT,
+                    source_key TEXT,
+                    track_id TEXT,
+                    title TEXT,
+                    artist TEXT,
+                    album TEXT,
+                    href TEXT,
+                    track_json TEXT NOT NULL DEFAULT '{}',
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(session_id) REFERENCES sessions(id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_session_queue_items_session_state_position
+                ON session_queue_items(session_id, state, position, id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_session_queue_items_session_track
+                ON session_queue_items(session_id, track_id)
+                """
+            )
 
     def list_preferences(self) -> list[dict[str, Any]]:
         with self._connect() as connection:
@@ -546,6 +580,305 @@ class PreferenceStore:
                 connection.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
         except sqlite3.Error as exc:
             raise PreferenceStoreError(f"Could not record session track: {exc}") from exc
+
+    def replace_session_queue(
+        self,
+        session_id: int,
+        items: list[dict[str, Any]],
+        *,
+        preserve_history: bool = False,
+    ) -> None:
+        try:
+            with self._connect() as connection:
+                if preserve_history:
+                    connection.execute(
+                        """
+                        UPDATE session_queue_items
+                        SET state = 'filtered', updated_at = CURRENT_TIMESTAMP
+                        WHERE session_id = ? AND state = 'queued'
+                        """,
+                        (session_id,),
+                    )
+                else:
+                    connection.execute("DELETE FROM session_queue_items WHERE session_id = ?", (session_id,))
+                position_start = self._next_session_queue_position(connection, session_id)
+                for offset, item in enumerate(items):
+                    track = dict(item.get("track") or {})
+                    source = dict(item.get("source") or {})
+                    track_id = self._queue_track_id(track)
+                    connection.execute(
+                        """
+                        INSERT INTO session_queue_items(
+                            session_id,
+                            position,
+                            source_kind,
+                            source_term,
+                            source_key,
+                            track_id,
+                            title,
+                            artist,
+                            album,
+                            href,
+                            track_json,
+                            state
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+                        """,
+                        (
+                            session_id,
+                            position_start + offset,
+                            source.get("kind"),
+                            source.get("term"),
+                            item.get("source_key"),
+                            track_id,
+                            track.get("title"),
+                            track.get("artist"),
+                            track.get("album"),
+                            track.get("href"),
+                            json.dumps(track, ensure_ascii=True),
+                        ),
+                    )
+                connection.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not replace session queue: {exc}") from exc
+
+    def append_session_queue(self, session_id: int, items: list[dict[str, Any]]) -> None:
+        if not items:
+            return
+        try:
+            with self._connect() as connection:
+                position_start = self._next_session_queue_position(connection, session_id)
+                for offset, item in enumerate(items):
+                    track = dict(item.get("track") or {})
+                    source = dict(item.get("source") or {})
+                    track_id = self._queue_track_id(track)
+                    connection.execute(
+                        """
+                        INSERT INTO session_queue_items(
+                            session_id,
+                            position,
+                            source_kind,
+                            source_term,
+                            source_key,
+                            track_id,
+                            title,
+                            artist,
+                            album,
+                            href,
+                            track_json,
+                            state
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued')
+                        """,
+                        (
+                            session_id,
+                            position_start + offset,
+                            source.get("kind"),
+                            source.get("term"),
+                            item.get("source_key"),
+                            track_id,
+                            track.get("title"),
+                            track.get("artist"),
+                            track.get("album"),
+                            track.get("href"),
+                            json.dumps(track, ensure_ascii=True),
+                        ),
+                    )
+                connection.execute("UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not append session queue: {exc}") from exc
+
+    def list_session_queue(
+        self,
+        session_id: int,
+        *,
+        limit: int = 50,
+        include_history: bool = False,
+    ) -> list[dict[str, Any]]:
+        where_state = "" if include_history else "AND state IN ('queued', 'playing')"
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT
+                    id,
+                    session_id,
+                    position,
+                    source_kind,
+                    source_term,
+                    source_key,
+                    track_id,
+                    title,
+                    artist,
+                    album,
+                    href,
+                    track_json,
+                    state,
+                    created_at,
+                    updated_at
+                FROM session_queue_items
+                WHERE session_id = ?
+                {where_state}
+                ORDER BY position ASC, id ASC
+                LIMIT ?
+                """,
+                (session_id, limit),
+            ).fetchall()
+        return [self._decode_session_queue_row(row) for row in rows]
+
+    def claim_next_session_queue_item(self, session_id: int) -> dict[str, Any] | None:
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT
+                        id,
+                        session_id,
+                        position,
+                        source_kind,
+                        source_term,
+                        source_key,
+                        track_id,
+                        title,
+                        artist,
+                        album,
+                        href,
+                        track_json,
+                        state,
+                        created_at,
+                        updated_at
+                    FROM session_queue_items
+                    WHERE session_id = ? AND state = 'queued'
+                    ORDER BY position ASC, id ASC
+                    LIMIT 1
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if row is None:
+                    return None
+                connection.execute(
+                    """
+                    UPDATE session_queue_items
+                    SET state = 'playing', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (int(row["id"]),),
+                )
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not claim next session queue item: {exc}") from exc
+        claimed = self.get_session_queue_item(int(row["id"]))
+        return claimed
+
+    def get_session_queue_item(self, queue_item_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    id,
+                    session_id,
+                    position,
+                    source_kind,
+                    source_term,
+                    source_key,
+                    track_id,
+                    title,
+                    artist,
+                    album,
+                    href,
+                    track_json,
+                    state,
+                    created_at,
+                    updated_at
+                FROM session_queue_items
+                WHERE id = ?
+                """,
+                (queue_item_id,),
+            ).fetchone()
+        return self._decode_session_queue_row(row) if row is not None else None
+
+    def mark_session_queue_item(self, queue_item_id: int, state: str) -> None:
+        if state not in {"queued", "playing", "played", "rejected", "filtered", "failed"}:
+            raise PreferenceStoreError(f"Unsupported session queue state: {state}")
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE session_queue_items
+                    SET state = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    """,
+                    (state, queue_item_id),
+                )
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not mark session queue item: {exc}") from exc
+
+    def mark_session_queue_track(self, session_id: int, track_id: str, state: str) -> int:
+        if state not in {"queued", "playing", "played", "rejected", "filtered", "failed"}:
+            raise PreferenceStoreError(f"Unsupported session queue state: {state}")
+        try:
+            with self._connect() as connection:
+                cursor = connection.execute(
+                    """
+                    UPDATE session_queue_items
+                    SET state = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ? AND track_id = ? AND state IN ('queued', 'playing')
+                    """,
+                    (state, session_id, track_id),
+                )
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not mark session queue track: {exc}") from exc
+        return int(cursor.rowcount)
+
+    def reset_stale_session_queue_items(self, session_id: int) -> None:
+        try:
+            with self._connect() as connection:
+                connection.execute(
+                    """
+                    UPDATE session_queue_items
+                    SET state = 'queued', updated_at = CURRENT_TIMESTAMP
+                    WHERE session_id = ? AND state = 'playing'
+                    """,
+                    (session_id,),
+                )
+        except sqlite3.Error as exc:
+            raise PreferenceStoreError(f"Could not reset stale session queue items: {exc}") from exc
+
+    def _next_session_queue_position(self, connection: sqlite3.Connection, session_id: int) -> int:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(position), -1) + 1 AS next_position FROM session_queue_items WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return int(row["next_position"]) if row is not None else 0
+
+    def _queue_track_id(self, track: dict[str, Any]) -> str | None:
+        track_id = str(track.get("id") or track.get("play_params", {}).get("id") or "").strip()
+        return track_id or None
+
+    def _decode_session_queue_row(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            track = json.loads(row["track_json"])
+        except (TypeError, json.JSONDecodeError):
+            track = {}
+        if not isinstance(track, dict):
+            track = {}
+        return {
+            "id": int(row["id"]),
+            "session_id": int(row["session_id"]),
+            "position": int(row["position"]),
+            "source": {
+                "kind": row["source_kind"],
+                "term": row["source_term"],
+            },
+            "source_key": row["source_key"],
+            "track_id": row["track_id"],
+            "title": row["title"],
+            "artist": row["artist"],
+            "album": row["album"],
+            "href": row["href"],
+            "track": track,
+            "state": row["state"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def list_session_tracks(self, session_id: int, *, limit: int = 20) -> list[dict[str, Any]]:
         with self._connect() as connection:

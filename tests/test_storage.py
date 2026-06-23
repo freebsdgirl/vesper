@@ -43,3 +43,59 @@ def test_concurrent_start_session_leaves_exactly_one_active(settings) -> None:
     with sqlite3.connect(settings.database_path) as connection:
         active = connection.execute("SELECT COUNT(*) FROM sessions WHERE is_active = 1").fetchone()[0]
     assert active == 1
+
+
+def test_session_queue_round_trip_and_claim(settings) -> None:
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play upbeat music")
+
+    store.replace_session_queue(
+        session["id"],
+        [
+            {
+                "source": {"kind": "legacy", "term": "wide"},
+                "source_key": "wide",
+                "track": {"id": "track-1", "title": "One", "artist": "Artist"},
+            },
+            {
+                "source": {"kind": "legacy", "term": "wide"},
+                "source_key": "wide",
+                "track": {"id": "track-2", "title": "Two", "artist": "Artist"},
+            },
+        ],
+    )
+
+    first = store.claim_next_session_queue_item(session["id"])
+    queued = store.list_session_queue(session["id"], include_history=True)
+
+    assert first is not None
+    assert first["title"] == "One"
+    assert [item["state"] for item in queued] == ["playing", "queued"]
+
+    store.mark_session_queue_item(first["id"], "played")
+    store.mark_session_queue_track(session["id"], "track-2", "rejected")
+
+    queued = store.list_session_queue(session["id"], include_history=True)
+    assert [item["state"] for item in queued] == ["played", "rejected"]
+
+
+def test_reset_stale_session_queue_items(settings) -> None:
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play upbeat music")
+    store.replace_session_queue(
+        session["id"],
+        [
+            {
+                "source": {"kind": "legacy", "term": "wide"},
+                "source_key": "wide",
+                "track": {"id": "track-1", "title": "One"},
+            }
+        ],
+    )
+
+    claimed = store.claim_next_session_queue_item(session["id"])
+    assert claimed is not None
+
+    store.reset_stale_session_queue_items(session["id"])
+
+    assert store.list_session_queue(session["id"])[0]["state"] == "queued"

@@ -310,6 +310,7 @@ def test_openai_compatible_resolver_uses_compact_allowed_action_list(settings: S
     assert isinstance(messages, list)
     user_prompt = messages[1]["content"]
     assert "allowed_actions" in user_prompt
+    assert '"preferences"' not in user_prompt
     assert "move_queue_item" not in user_prompt
     assert "remove_queue_item" not in user_prompt
     assert "clear_queue" not in user_prompt
@@ -1278,6 +1279,49 @@ def test_select_session_track_returns_index_from_real_candidates(settings: Setti
     assert selection.selected_index == 1
 
 
+def test_filter_session_queue_parses_eligible_indices_and_policy(settings: Settings, service) -> None:
+    resolver_settings = Settings(
+        http_host=settings.http_host,
+        http_port=settings.http_port,
+        public_base_url=settings.public_base_url,
+        cider_base_url=settings.cider_base_url,
+        cider_api_token=settings.cider_api_token,
+        default_search_source=settings.default_search_source,
+        resolver_backend="openai_compatible",
+        resolver_base_url="https://resolver.example/v1",
+        resolver_model="gpt-test",
+        resolver_api_key="secret",
+        resolver_include_reasoning=False,
+        resolver_include_raw_output=False,
+        request_timeout_seconds=settings.request_timeout_seconds,
+        verify_tls=settings.verify_tls,
+        log_level=settings.log_level,
+        database_path=settings.database_path,
+        config_path=settings.config_path,
+    )
+
+    class QueueFilterTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            body = {"choices": [{"message": {"content": json.dumps({"eligible_indices": [1, 0, 9, 1], "queue_policy": "shuffle"})}}]}
+            return httpx.Response(200, json=body)
+
+    session = httpx.Client(base_url=resolver_settings.resolver_base_url, transport=QueueFilterTransport())
+    resolver = OpenAICompatibleResolver(resolver_settings, session=session)
+
+    decision = resolver.filter_session_queue(
+        "more pop",
+        service,
+        {"request_text": "play upbeat music", "steering_history": ["more pop"]},
+        [
+            {"id": "a", "title": "One", "artist": "Artist A"},
+            {"id": "b", "title": "Two", "artist": "Artist B"},
+        ],
+    )
+
+    assert decision.eligible_indices == [1, 0]
+    assert decision.queue_policy == "shuffle"
+
+
 def test_session_plan_prompt_omits_recent_track_history(settings: Settings, service) -> None:
     captured_payload: dict[str, object] = {}
 
@@ -1316,6 +1360,7 @@ def test_session_plan_prompt_omits_recent_track_history(settings: Settings, serv
     prompt = captured_payload["messages"][1]["content"]
     assert '"session_request"' in prompt
     assert '"session_steering"' in prompt
+    assert '"preferences"' not in prompt
     assert '"recent_tracks"' not in prompt
     assert '"global_recent_tracks"' not in prompt
     system_prompt = captured_payload["messages"][0]["content"]
