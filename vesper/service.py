@@ -59,14 +59,39 @@ def _elapsed_ms(start: float) -> float:
     return round((time.perf_counter() - start) * 1000.0, 2)
 
 
-def _flatten_track_item(item: dict[str, Any]) -> dict[str, Any]:
-    attributes = item.get("attributes", {}) if isinstance(item, dict) else {}
-    play_params = attributes.get("playParams", {}) if isinstance(attributes, dict) else {}
-    artwork = attributes.get("artwork", {}) if isinstance(attributes, dict) else {}
+def _track_attributes(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {}
+    attributes = item.get("attributes")
+    if isinstance(attributes, dict):
+        return attributes
+    if "attributes" in item:
+        return {}
+    return item
+
+
+def _now_playing_info(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    info = payload.get("info", {})
+    if isinstance(info, list):
+        for item in info:
+            attributes = _track_attributes(item)
+            if attributes:
+                return attributes
+        return {}
+    return _track_attributes(info)
+
+
+def _flatten_track_item(item: Any) -> dict[str, Any]:
+    raw_item = item if isinstance(item, dict) else {}
+    attributes = _track_attributes(item)
+    play_params = attributes.get("playParams", {})
+    artwork = attributes.get("artwork", {})
     return {
-        "id": item.get("id"),
-        "type": item.get("type"),
-        "href": item.get("href"),
+        "id": raw_item.get("id"),
+        "type": raw_item.get("type"),
+        "href": raw_item.get("href"),
         "title": attributes.get("name"),
         "artist": attributes.get("artistName"),
         "album": attributes.get("albumName"),
@@ -469,7 +494,7 @@ class CiderAgentService:
 
     def get_now_playing(self) -> dict[str, Any]:
         payload = self._rpc.playback_get("/now-playing")
-        info = payload.get("info", {}) if isinstance(payload, dict) else {}
+        info = _now_playing_info(payload)
         return {
             "status": "ok",
             "source": "cider-rpc",
@@ -501,7 +526,7 @@ class CiderAgentService:
         repeat_payload = payloads["repeat"]
         shuffle_payload = payloads["shuffle"]
         autoplay_payload = payloads["autoplay"]
-        info = now_playing_payload.get("info", {}) if isinstance(now_playing_payload, dict) else {}
+        info = _now_playing_info(now_playing_payload)
         queue = self._queue_result(queue_payload)
         return {
             "status": "ok",

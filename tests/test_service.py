@@ -384,6 +384,31 @@ def test_session_worker_can_advance_when_now_playing_track_has_ended(service) ->
     assert service._should_advance_session(session, service.playback_snapshot()) is True
 
 
+def test_active_session_reconcile_tolerates_empty_now_playing_info_list(settings, service) -> None:
+    service._preferences.start_session(request_text="play upbeat music")
+
+    class EmptyNowPlayingRpc(service._rpc.__class__):
+        def playback_get(self, path: str):
+            if path == "/now-playing":
+                self.playback_get_calls.append(path)
+                return {"info": []}
+            return super().playback_get(path)
+
+    rpc = EmptyNowPlayingRpc()
+
+    restarted = CiderAgentService(
+        settings,
+        rpc_client=rpc,
+        preference_store=PreferenceStore(settings.database_path),
+        resolver=service._resolver,
+    )
+
+    assert restarted.playback_snapshot()["track"]["title"] is None
+    assert restarted.get_now_playing()["track"]["title"] is None
+    assert restarted.play()["status"] == "ok"
+    assert rpc.posts[-1]["path"] == "/play"
+
+
 def test_session_worker_respects_persisted_cooldown_across_processes(settings, service, tmp_path) -> None:
     database_path = tmp_path / "cross-process-cooldown.db"
     rpc = service._rpc.__class__()
