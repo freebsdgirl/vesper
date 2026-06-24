@@ -73,7 +73,7 @@ Saved preferences are stored and applied by Vesper itself, not exposed as resolv
 
 The resolver participates in these adaptive-session decisions:
 
-1. `plan_session` — produce one or more typed search sources for the next session step.
+1. `plan_session` — produce typed search sources for the next session step. The current built-in OpenAI-compatible planner asks for one source at a time on session start/replan; mid-session steering can still add more sources later.
 2. `select_session_playlist` / `rephrase_session_vibe` — handle playlist-oriented session searches and empty vibe searches.
 3. `filter_session_queue` — filter remaining materialized queue rows after steering.
 

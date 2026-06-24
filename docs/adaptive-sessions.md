@@ -95,6 +95,8 @@ The planner can also return `queue_policy`:
 | `source_order` | Keep the materialized queue in the order produced by the source lookup. This is the default. |
 | `shuffle` | Shuffle the concrete queue rows after materialization. |
 
+There is no built-in interleave policy today. If multiple sources are materialized together, Vesper either keeps their produced order or shuffles the combined concrete rows.
+
 ## How the LLM Chooses Search Types
 
 For adaptive-session planning, the OpenAI-compatible resolver receives:
@@ -116,9 +118,42 @@ Its planning instruction is constrained:
 - use creative interpretation mainly for open-ended/contextual/activity requests;
 - do not invent final tracks.
 
+The session data model can store multiple active typed sources, but the built-in OpenAI-compatible planner currently asks for one source at a time for a new session start or replan. Additional sources can still be added later through steering with `search_update.mode = add`.
+
 The resolver returns only the source. Vesper performs the real Apple Music lookup. If the source is `preference`, Vesper locally builds the pool from saved likes and favored artists without exposing those saved preference rows to the resolver.
 
 The planner does not choose the next track during normal session advances. It chooses a source, and Vesper materializes that source into concrete persisted queue rows. Later advances claim the next eligible row from SQLite.
+
+## Current Multi-Source Behavior
+
+The current implementation supports **additive multi-source steering**, but it does **not** yet support a true multi-source session start in the built-in planner.
+
+### Follow-up additive requests
+
+Example:
+
+1. `play some nirvana`
+2. `add some nine inch nails`
+
+If the follow-up resolves to `steer_session` with `search_update.mode = add`, Vesper keeps the existing session, looks up the new typed source, and appends concrete queue rows for that new source to the persisted session queue.
+
+What this means in practice:
+
+- Nine Inch Nails results are added to the same Vesper session queue as the Nirvana results.
+- The new rows are appended after the existing queued rows; they are not interleaved into the remaining queue.
+- The current track is not interrupted. The change is usually audible on later tracks.
+
+### Initial multi-artist or multi-source starts
+
+Example:
+
+- `play a mix of nirvana and nine inch nails`
+
+This is **not currently a true multi-source session start** in the built-in resolver flow. The session engine can materialize multiple sources into one queue, but the built-in session-start planner currently plans at most one starting source. So this request does not reliably trigger two independent artist searches whose results are combined into one queue before playback starts.
+
+### Rebuild and refill limitation
+
+When a session already has multiple active sources because of additive steering, the existing materialized queue can contain rows from all of them. However, future empty-queue rebuilds and replans currently reuse the first active source from runtime rather than rebuilding a balanced multi-source mix. In other words, additive multi-source sessions are real for the current materialized queue, but that behavior is not yet preserved as a first-class session-start/rebuild strategy.
 
 ## Is the User's Search Used Verbatim?
 
@@ -273,6 +308,8 @@ When steering runs, Vesper:
 | `replace` | Replace active sources and rebuild the materialized queue for the new direction. |
 
 For a request like `prefer female vocalists`, the resolver may preserve the current source and filter the remaining queue, or it may add/replace sources if it can express the steering as an `artist`, `genre`, or `vibe` source. The exact choice depends on resolver output.
+
+For a request like `add some nine inch nails`, `add` mode appends queue rows for the new source after the currently queued rows. It does not currently weave the two sources together like shuffled decks of cards.
 
 Steering is cumulative. Resolver prompts tell the model to treat steering as persistent session state, not a one-turn hint, until explicitly overridden.
 
