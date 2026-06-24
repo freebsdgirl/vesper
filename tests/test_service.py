@@ -356,6 +356,20 @@ def test_session_worker_does_not_advance_when_now_playing_has_remaining_time(ser
     assert service._should_advance_session(session, service.playback_snapshot()) is False
 
 
+def test_session_worker_does_not_advance_when_remaining_time_conflicts_with_progress(service) -> None:
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    service._rpc.current_track["attributes"]["currentPlaybackTime"] = 15
+    service._rpc.current_track["attributes"]["remainingTime"] = 0
+    service._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    assert service._should_advance_session(session, service.playback_snapshot()) is False
+
+
 def test_session_worker_does_not_advance_when_playing_state_is_unknown(service) -> None:
     service.play_session("play upbeat music")
     session = service._preferences.get_active_session()

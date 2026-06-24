@@ -1896,7 +1896,7 @@ class SessionEngine:
         if not _clean_id(track.get("track_id")):
             return False
         remaining = self._numeric_value(track.get("remaining_time"))
-        if remaining is not None:
+        if remaining is not None and remaining > 1.0:
             return remaining > 1.0
         current = self._numeric_value(track.get("current_playback_time"))
         duration = self._numeric_value(track.get("duration_millis"))
@@ -1904,6 +1904,8 @@ class SessionEngine:
             duration_seconds = duration / 1000.0 if duration > 1000 else duration
             current_seconds = current / 1000.0 if current > duration_seconds + 5 and current <= duration + 5 else current
             return current_seconds < duration_seconds - 1.0
+        if remaining is not None:
+            return False
         # Cider may briefly report is-playing false while still exposing the
         # current track during startup/buffering. Treat that as not advanceable
         # unless timing data proves the track has ended.
