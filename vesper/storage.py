@@ -776,9 +776,10 @@ class PreferenceStore:
                     """,
                     (int(row["id"]),),
                 )
+                claimed = self._decode_session_queue_row(row)
+                claimed["state"] = "playing"
         except sqlite3.Error as exc:
             raise PreferenceStoreError(f"Could not claim next session queue item: {exc}") from exc
-        claimed = self.get_session_queue_item(int(row["id"]))
         return claimed
 
     def get_session_queue_item(self, queue_item_id: int) -> dict[str, Any] | None:

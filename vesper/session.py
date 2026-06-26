@@ -26,7 +26,7 @@ from typing import Any, Protocol
 
 from .errors import CiderValidationError
 from .output import compact_output
-from .resolver import SessionQueryPlan, SessionQueueDecision, SessionSearchSource, SessionTrackSelection
+from .resolver import SessionQueryPlan, SessionQueueDecision, SessionSearchSource, SessionTrackSelection, _normalize_eligible_indices
 from .service import (
     _clean_id,
     _elapsed_ms,
@@ -679,8 +679,6 @@ class SessionEngine:
                 self._check_worker_cancelled()
                 play_started_at = time.perf_counter()
                 playback_result = self._host._play_flattened_track(lead_track, is_library_default=False)
-                if queue_item is not None:
-                    self._preferences.mark_session_queue_item(queue_item["id"], "playing")
                 timings["play_track_ms"] = _elapsed_ms(play_started_at)
                 record_selected_started_at = time.perf_counter()
                 self._preferences.add_session_track(session["id"], lead_track)
@@ -906,7 +904,7 @@ class SessionEngine:
         self._mark_current_queue_item_played(session["id"])
         queue_item = self._preferences.claim_next_session_queue_item(session["id"])
         if queue_item is None:
-            return [], SessionSearchSource(kind="vibe", term=""), SessionTrackSelection(selected_index=0, resolver="queue"), None
+            return [], SessionSearchSource(kind="vibe", term=""), SessionTrackSelection(selected_index=0, resolver="session-queue"), None
         source_values = queue_item.get("source")
         sources = self._normalize_search_sources([source_values] if isinstance(source_values, dict) else [])
         source = sources[0] if sources else SessionSearchSource(kind="vibe", term=str(queue_item.get("source_term") or ""))
@@ -959,7 +957,7 @@ class SessionEngine:
                 if callable(chooser)
                 else SessionQueueDecision(eligible_indices=list(range(len(batch))), resolver="fallback")
             )
-            eligible = self._normalize_eligible_indices(getattr(decision, "eligible_indices", []), len(batch))
+            eligible = _normalize_eligible_indices(getattr(decision, "eligible_indices", []), len(batch))
             resolved_policy = self._normalize_queue_policy(getattr(decision, "queue_policy", resolved_policy))
             for index in eligible:
                 item = batch[index]
@@ -984,20 +982,6 @@ class SessionEngine:
                 "queue_policy": resolved_policy,
             },
         )
-
-    def _normalize_eligible_indices(self, value: Any, candidate_count: int) -> list[int]:
-        if not isinstance(value, list):
-            return list(range(candidate_count))
-        indices: list[int] = []
-        seen: set[int] = set()
-        for item in value:
-            if not isinstance(item, int):
-                continue
-            if item < 0 or item >= candidate_count or item in seen:
-                continue
-            seen.add(item)
-            indices.append(item)
-        return indices
 
     def _normalize_session_search_update(self, value: dict[str, Any] | None) -> dict[str, Any]:
         if not isinstance(value, dict):
@@ -1641,197 +1625,6 @@ class SessionEngine:
                     "pool_count": len(pools),
                 },
             )
-
-    def _current_session_track_id(self, session: dict[str, Any]) -> str:
-        playback = self.session_planning_playback_snapshot(session)
-        current = playback.get("track", {})
-        return _clean_id(current.get("track_id"))
-
-    def _next_session_candidate_window(
-        self,
-        session: dict[str, Any],
-        source: SessionSearchSource,
-    ) -> list[dict[str, Any]]:
-        # Session selection is intentionally cursor-based and sequential:
-        # build one ordered pool per search query, offer the next window of
-        # fresh tracks starting at the pool cursor, and rely on entry state
-        # (`played`, `screened_out`, `rejected`) to prevent replaying the same
-        # candidates until the pool has been exhausted and explicitly reset.
-        if isinstance(source, str):
-            source = SessionSearchSource(kind="legacy", term=source)
-        runtime = self._get_session_runtime(session["id"])
-        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
-        source_key = self._session_source_key(source)
-        if source_key not in pools and source.term in pools:
-            source_key = source.term
-        else:
-            self._ensure_session_query_pools(session, [source])
-            runtime = self._get_session_runtime(session["id"])
-            pools = self._normalize_session_query_pools(runtime.get("query_pools"))
-        pool = pools.get(source_key)
-        if not pool:
-            return []
-        current_track_id = self._current_session_track_id(session)
-        for _ in range(3):
-            window = self._gather_session_query_pool_window(pool, current_track_id=current_track_id)
-            self._host.append_session_debug_log(
-                stage="session_candidate_window",
-                payload={
-                    "session_id": session.get("id"),
-                    "search_source": {"kind": source.kind, "term": source.term},
-                    "cursor": pool.get("cursor", 0),
-                    "pool_track_count": len(pool.get("entries", [])),
-                    "window_track_count": len(window),
-                    "window_tracks": [
-                        {
-                            "index": entry["index"],
-                            "id": entry["track"].get("id"),
-                            "title": entry["track"].get("title"),
-                            "artist": entry["track"].get("artist"),
-                            "album": entry["track"].get("album"),
-                        }
-                        for entry in window
-                    ],
-                },
-            )
-            if window:
-                return window
-            # Once a pool has no fresh candidates left, screened-out tracks are
-            # reconsidered before played tracks. Rejected tracks are never reset
-            # here; they stay unavailable until the pool is rebuilt.
-            if self._reset_session_query_pool_state(pool, from_state="screened_out"):
-                pools[source_key] = pool
-                self._set_session_runtime(session["id"], query_pools=pools)
-                continue
-            if self._reset_session_query_pool_state(pool, from_state="played"):
-                pools[source_key] = pool
-                self._set_session_runtime(session["id"], query_pools=pools)
-                continue
-            return []
-        return []
-
-    def _gather_session_query_pool_window(
-        self,
-        pool: dict[str, Any],
-        *,
-        current_track_id: str,
-    ) -> list[dict[str, Any]]:
-        # This is deliberately simple: starting at the cursor, walk forward
-        # through the ordered pool and collect the first N fresh entries.
-        # There is no diversification, reranking, or random sampling here.
-        entries = list(pool.get("entries", []))
-        if not entries:
-            return []
-        cursor = int(pool.get("cursor", 0)) % len(entries)
-        window: list[dict[str, Any]] = []
-        for offset in range(len(entries)):
-            index = (cursor + offset) % len(entries)
-            entry = entries[index]
-            if entry.get("state") != "fresh":
-                continue
-            track = entry.get("track", {})
-            track_id = _clean_id(track.get("id")) or _clean_id(track.get("play_params", {}).get("id"))
-            if current_track_id and track_id == current_track_id:
-                continue
-            window.append({"index": index, "track": track})
-            if len(window) >= self._host.SESSION_SELECTION_WINDOW_SIZE:
-                break
-        return window
-
-    def _reset_session_query_pool_state(self, pool: dict[str, Any], *, from_state: str) -> bool:
-        changed = False
-        for entry in pool.get("entries", []):
-            if entry.get("state") == from_state:
-                entry["state"] = "fresh"
-                changed = True
-        return changed
-
-    def _update_session_query_pool_after_window(
-        self,
-        session_id: int,
-        search_query: str,
-        window: list[dict[str, Any]],
-        *,
-        selected_entry_index: int | None,
-        mark_state: str | None,
-    ) -> None:
-        runtime = self._get_session_runtime(session_id)
-        pools = self._normalize_session_query_pools(runtime.get("query_pools"))
-        pool = pools.get(search_query)
-        if not pool or not pool.get("entries"):
-            return
-        entries = pool["entries"]
-        # Window state is persistent across advances:
-        # - if the resolver rejects the whole window, every shown entry becomes
-        #   `screened_out`
-        # - if one entry is chosen, only that entry becomes `played`
-        # In both cases the cursor advances to just after the last shown entry,
-        # so the next call offers the next sequential slice of the pool.
-        if mark_state is not None:
-            for entry in window:
-                entries[entry["index"]]["state"] = mark_state
-        if selected_entry_index is not None and 0 <= selected_entry_index < len(entries):
-            entries[selected_entry_index]["state"] = "played"
-            selected_track = entries[selected_entry_index]["track"]
-            source_term = str(pool.get("source", {}).get("term") or pool.get("search_query") or search_query)
-            self._set_session_runtime(
-                session_id,
-                current_pool_query=search_query,
-                current_seed_query=str(selected_track.get("_seed_query", "")).strip() or source_term,
-                current_track_id=_clean_id(selected_track.get("id")) or _clean_id(selected_track.get("play_params", {}).get("id")),
-            )
-        last_index = window[-1]["index"]
-        pool["cursor"] = (last_index + 1) % len(entries)
-        pools[search_query] = pool
-        self._set_session_runtime(session_id, query_pools=pools)
-        self._host.append_session_debug_log(
-            stage="session_candidate_window_updated",
-            payload={
-                "session_id": session_id,
-                "search_query": search_query,
-                "applied_state": mark_state,
-                "selected_entry_index": selected_entry_index,
-                "new_cursor": pool["cursor"],
-                "window_tracks": [
-                    {
-                        "index": entry["index"],
-                        "id": entry["track"].get("id"),
-                        "title": entry["track"].get("title"),
-                        "artist": entry["track"].get("artist"),
-                    }
-                    for entry in window
-                ],
-            },
-        )
-
-    def _mark_session_selection_window_screened_out(
-        self,
-        session_id: int,
-        search_query: str,
-        window: list[dict[str, Any]],
-    ) -> None:
-        self._update_session_query_pool_after_window(
-            session_id,
-            search_query,
-            window,
-            selected_entry_index=None,
-            mark_state="screened_out",
-        )
-
-    def _mark_session_track_played(
-        self,
-        session_id: int,
-        search_query: str,
-        window: list[dict[str, Any]],
-        selected_entry_index: int,
-    ) -> None:
-        self._update_session_query_pool_after_window(
-            session_id,
-            search_query,
-            window,
-            selected_entry_index=selected_entry_index,
-            mark_state=None,
-        )
 
     def _mark_session_track_rejected(self, session_id: int, track_id: str) -> None:
         self._preferences.mark_session_queue_track(session_id, track_id, "rejected")

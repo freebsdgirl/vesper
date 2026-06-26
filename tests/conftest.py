@@ -372,27 +372,6 @@ class StubResolver:
             },
         )()
 
-    def select_session_track(
-        self,
-        request: str,
-        service: Any,
-        session: dict[str, Any],
-        search_query: str,
-        candidates: list[dict[str, Any]],
-    ):
-        return type(
-            "Selection",
-            (),
-            {
-                "selected_index": 0,
-                "resolver": "stub",
-                "raw": None,
-                "reasoning": None,
-                "raw_content": None,
-            },
-        )()
-
-
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
     return Settings(

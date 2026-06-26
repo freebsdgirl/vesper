@@ -65,9 +65,6 @@ def test_vibe_source_selects_playlist_once_and_keeps_playlist_order(service, mon
             playlist_selections.append(candidates)
             return SessionTrackSelection(selected_index=1, resolver="stub")
 
-        def select_session_track(self, request, service, session, search_query, candidates):
-            return SessionTrackSelection(selected_index=0, resolver="stub")
-
     service._resolver = Resolver()
     monkeypatch.setattr(
         service,
@@ -233,9 +230,6 @@ def test_empty_source_replans_once_with_rejected_source_excluded(service, monkey
                 else SessionSearchSource(kind="artist", term="RADWIMPS")
             )
             return SessionQueryPlan(search_sources=[source], resolver="stub")
-
-        def select_session_track(self, request, service, session, search_query, candidates):
-            return SessionTrackSelection(selected_index=0, resolver="stub")
 
     resolver = Resolver()
     service._resolver = resolver

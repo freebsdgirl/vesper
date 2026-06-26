@@ -1374,13 +1374,6 @@ class CiderAgentService:
     ) -> None:
         self._session._ensure_session_query_pools(session, search_sources)
 
-    def _next_session_candidate_window(
-        self,
-        session: dict[str, Any],
-        source: SessionSearchSource,
-    ) -> list[dict[str, Any]]:
-        return self._session._next_session_candidate_window(session, source)
-
     def _begin_resolver_debug_episode(self, reason: str) -> bool:
         path = self.resolver_debug_log_path()
         if path is None:

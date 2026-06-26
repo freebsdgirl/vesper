@@ -184,6 +184,21 @@ class FallbackResolver:
         return SessionQueueDecision(eligible_indices=list(range(len(candidates))), resolver="fallback")
 
 
+def _normalize_eligible_indices(value: Any, candidate_count: int) -> list[int]:
+    if not isinstance(value, list):
+        return list(range(candidate_count))
+    indices: list[int] = []
+    seen: set[int] = set()
+    for item in value:
+        if not isinstance(item, int):
+            continue
+        if item < 0 or item >= candidate_count or item in seen:
+            continue
+        seen.add(item)
+        indices.append(item)
+    return indices
+
+
 class OpenAICompatibleResolver:
     """Resolve text requests using an OpenAI-compatible chat completions endpoint."""
 
@@ -369,7 +384,7 @@ class OpenAICompatibleResolver:
         if callable(logger):
             logger(stage="filter_session_queue", messages=messages, response_body=body, response_content=content)
         return SessionQueueDecision(
-            eligible_indices=self._normalize_eligible_indices(parsed.get("eligible_indices"), len(candidates)),
+            eligible_indices=_normalize_eligible_indices(parsed.get("eligible_indices"), len(candidates)),
             resolver="openai_compatible",
             queue_policy=self._normalize_queue_policy(parsed.get("queue_policy")),
             raw=parsed,
@@ -576,20 +591,6 @@ class OpenAICompatibleResolver:
     def _normalize_queue_policy(self, value: Any) -> str:
         policy = str(value or "source_order").strip().lower()
         return policy if policy in {"source_order", "shuffle"} else "source_order"
-
-    def _normalize_eligible_indices(self, value: Any, candidate_count: int) -> list[int]:
-        if not isinstance(value, list):
-            return list(range(candidate_count))
-        indices: list[int] = []
-        seen: set[int] = set()
-        for item in value:
-            if not isinstance(item, int):
-                continue
-            if item < 0 or item >= candidate_count or item in seen:
-                continue
-            seen.add(item)
-            indices.append(item)
-        return indices
 
     def _complete_json(self, messages: list[dict[str, str]], headers: dict[str, str]) -> tuple[dict[str, Any], str]:
         payload = {
