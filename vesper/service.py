@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from functools import wraps
 import logging
@@ -24,10 +23,6 @@ from .historian import (
     reset_operation,
 )
 from .action_registry import get_action_definition, list_action_definitions, list_public_action_definitions
-from .catalog import (
-    flatten_track_item as _flatten_track_item,
-    now_playing_info as _now_playing_info,
-)
 from .errors import (
     CiderAgentError,
     CiderValidationError,
@@ -44,12 +39,10 @@ from .rpc import CiderRpcClient
 from .storage import PreferenceStore, close_connections
 from .output import (
     compact_resolved_action,
-    compact_track,
     finalize_output,
     summarize_execution,
 )
 from .matching import artist_track_score
-from .validation import validate_index
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
@@ -59,6 +52,7 @@ from .utils import _clean_id, _elapsed_ms, _extract_is_playing, _preference_targ
 from .session import SessionEngine
 from .preference_controller import PreferenceController
 from .search_controller import SearchController
+from .playback_controller import PlaybackController
 
 
 LOGGER = logging.getLogger(__name__)
@@ -119,6 +113,7 @@ class CiderAgentService:
         )
         self._preferences_ctrl = PreferenceController(self, preferences=self._preferences)
         self._search_ctrl = SearchController(self, rpc=self._rpc)
+        self._playback_ctrl = PlaybackController(self, rpc=self._rpc, preferences=self._preferences, settings=self._settings)
         self._genre_cache = self._search_ctrl._genre_cache
         self.reconcile_session_runtime()
 
@@ -319,106 +314,16 @@ class CiderAgentService:
         self._session.stop_background_session_worker(timeout=timeout)
 
     def status(self) -> dict[str, Any]:
-        playback = self.playback_snapshot()
-        payload = {
-            "status": "ok",
-            "source": "vesper",
-            "config": self._settings.sanitized(),
-            "playback": playback,
-            "preferences_count": len(self._preferences.list_preferences()),
-        }
-        if self.response_detail() == "compact":
-            queue = playback.get("queue", {})
-            session = self._preferences.get_active_session()
-            return {
-                "status": "ok",
-                "source": "vesper",
-                "playback": {
-                    "is_playing": playback.get("is_playing"),
-                    "track": compact_track(playback.get("track", {})),
-                    "volume": playback.get("volume"),
-                    "queue_length": queue.get("count", 0) if isinstance(queue, dict) else 0,
-                },
-                "queue": {
-                    "count": queue.get("count", 0) if isinstance(queue, dict) else 0,
-                    "tracks": [
-                        compact_track(item["track"])
-                        for item in (queue.get("items", []) if isinstance(queue, dict) else [])[:5]
-                        if isinstance(item, dict) and isinstance(item.get("track"), dict)
-                    ],
-                },
-                "session": {
-                    "id": session.get("id"),
-                    "is_active": session.get("is_active"),
-                    "mode": session.get("mode"),
-                }
-                if isinstance(session, dict)
-                else None,
-                "preferences_count": payload["preferences_count"],
-            }
-        return payload
+        return self._playback_ctrl.status()
 
     def get_now_playing(self) -> dict[str, Any]:
-        payload = self._rpc.playback_get("/now-playing")
-        info = _now_playing_info(payload)
-        return {
-            "status": "ok",
-            "source": "cider-rpc",
-            "track": _flatten_track_item({"attributes": info}),
-            "raw": payload,
-        }
+        return self._playback_ctrl.get_now_playing()
 
     def playback_snapshot(self) -> dict[str, Any]:
-        snapshot_paths = {
-            "is_playing": "/is-playing",
-            "now_playing": "/now-playing",
-            "volume": "/volume",
-            "queue": "/queue",
-            "repeat": "/repeat-mode",
-            "shuffle": "/shuffle-mode",
-            "autoplay": "/autoplay",
-        }
-        with ThreadPoolExecutor(max_workers=len(snapshot_paths)) as executor:
-            payloads = {
-                name: future.result()
-                for name, future in {
-                    name: executor.submit(self._rpc.playback_get, path) for name, path in snapshot_paths.items()
-                }.items()
-            }
-        is_playing_payload = payloads["is_playing"]
-        now_playing_payload = payloads["now_playing"]
-        volume_payload = payloads["volume"]
-        queue_payload = payloads["queue"]
-        repeat_payload = payloads["repeat"]
-        shuffle_payload = payloads["shuffle"]
-        autoplay_payload = payloads["autoplay"]
-        info = _now_playing_info(now_playing_payload)
-        queue = self._queue_result(queue_payload)
-        return {
-            "status": "ok",
-            "source": "cider-rpc",
-            "is_playing": self._extract_is_playing(is_playing_payload),
-            "track": {
-                "title": info.get("name"),
-                "artist": info.get("artistName"),
-                "album": info.get("albumName"),
-                "track_id": info.get("playParams", {}).get("id"),
-                "kind": info.get("playParams", {}).get("kind"),
-                "is_library": info.get("playParams", {}).get("isLibrary"),
-                "current_playback_time": info.get("currentPlaybackTime"),
-                "remaining_time": info.get("remainingTime"),
-                "duration_millis": info.get("durationInMillis"),
-            },
-            "volume": volume_payload.get("volume") if isinstance(volume_payload, dict) else None,
-            "repeat_mode": repeat_payload.get("value") if isinstance(repeat_payload, dict) else None,
-            "shuffle_mode": shuffle_payload.get("value") if isinstance(shuffle_payload, dict) else None,
-            "autoplay": autoplay_payload.get("value") if isinstance(autoplay_payload, dict) else None,
-            "queue_length": queue["count"],
-            "queue": queue,
-        }
+        return self._playback_ctrl.playback_snapshot()
 
     def is_playing(self) -> dict[str, Any]:
-        return {"status": "ok", "is_playing": self._extract_is_playing(self._rpc.playback_get("/is-playing"))}
+        return self._playback_ctrl.is_playing()
 
     @_historian_operation
     def play(self) -> dict[str, Any]:
@@ -466,7 +371,7 @@ class CiderAgentService:
             return result
 
     def playpause(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/playpause")}
+        return self._playback_ctrl.playpause()
 
     @_historian_operation
     def stop(self) -> dict[str, Any]:
@@ -530,80 +435,52 @@ class CiderAgentService:
             return result
 
     def get_volume(self) -> dict[str, Any]:
-        return {"status": "ok", "volume": self._rpc.playback_get("/volume")}
+        return self._playback_ctrl.get_volume()
 
     def set_volume(self, volume: int) -> dict[str, Any]:
-        if volume < 0 or volume > 100:
-            raise CiderValidationError("volume must be between 0 and 100.")
-        normalized_volume = volume / 100.0
-        return {
-            "status": "ok",
-            "requested_volume": volume,
-            "normalized_volume": normalized_volume,
-            "result": self._rpc.playback_post("/volume", {"volume": normalized_volume}),
-        }
+        return self._playback_ctrl.set_volume(volume)
 
     def get_repeat_mode(self) -> dict[str, Any]:
-        return {"status": "ok", "repeat_mode": self._rpc.playback_get("/repeat-mode")}
+        return self._playback_ctrl.get_repeat_mode()
 
     def toggle_repeat(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-repeat")}
+        return self._playback_ctrl.toggle_repeat()
 
     def get_shuffle_mode(self) -> dict[str, Any]:
-        return {"status": "ok", "shuffle_mode": self._rpc.playback_get("/shuffle-mode")}
+        return self._playback_ctrl.get_shuffle_mode()
 
     def toggle_shuffle(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-shuffle")}
+        return self._playback_ctrl.toggle_shuffle()
 
     def get_autoplay(self) -> dict[str, Any]:
-        return {"status": "ok", "autoplay": self._rpc.playback_get("/autoplay")}
+        return self._playback_ctrl.get_autoplay()
 
     def toggle_autoplay(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/toggle-autoplay")}
+        return self._playback_ctrl.toggle_autoplay()
 
     def get_queue(self) -> dict[str, Any]:
-        return self._queue_result(self._rpc.playback_get("/queue"))
+        return self._playback_ctrl.get_queue()
 
     def _queue_result(self, payload: Any) -> dict[str, Any]:
-        items = payload if isinstance(payload, list) else []
-        return {
-            "status": "ok",
-            "count": len(items),
-            "items": [
-                {
-                    "index": index,
-                    "track": _flatten_track_item(item),
-                }
-                for index, item in enumerate(items)
-            ],
-            "raw": payload,
-        }
+        return self._playback_ctrl._queue_result(payload)
 
     def play_next(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/play-next", item)}
+        return self._playback_ctrl.play_next(item)
 
     def play_later(self, item: dict[str, Any]) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/play-later", item)}
+        return self._playback_ctrl.play_later(item)
 
     def move_queue_item(self, from_index: int, to_index: int) -> dict[str, Any]:
-        validate_index(from_index, "from_index")
-        validate_index(to_index, "to_index")
-        return {
-            "status": "ok",
-            "result": self._rpc.playback_post("/queue/move-to-position", {"fromIndex": from_index, "toIndex": to_index}),
-        }
+        return self._playback_ctrl.move_queue_item(from_index, to_index)
 
     def remove_queue_item(self, index: int) -> dict[str, Any]:
-        validate_index(index, "index")
-        return {"status": "ok", "result": self._rpc.playback_post("/queue/remove-by-index", {"index": index})}
+        return self._playback_ctrl.remove_queue_item(index)
 
     def clear_queue(self) -> dict[str, Any]:
-        return {"status": "ok", "result": self._rpc.playback_post("/queue/clear-queue")}
+        return self._playback_ctrl.clear_queue()
 
     def play_url(self, url: str) -> dict[str, Any]:
-        if not url.strip():
-            raise CiderValidationError("url cannot be empty.")
-        return {"status": "ok", "result": self._rpc.playback_post("/play-url", {"url": url})}
+        return self._playback_ctrl.play_url(url)
 
     @_historian_operation
     def play_item(
@@ -614,31 +491,10 @@ class CiderAgentService:
         is_library: bool = False,
         track: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if not item_id.strip():
-            raise CiderValidationError("item_id cannot be empty.")
-        body = {"id": item_id, "type": kind, "isLibrary": is_library}
-        result = {"status": "ok", "result": self._rpc.playback_post("/play-item", body)}
-        track_payload = self._track_payload(track) or {}
-        track_payload.update({"id": item_id, "kind": kind, "is_library": is_library})
-        track_payload.setdefault("title", None)
-        track_payload.setdefault("artist", None)
-        track_payload.setdefault("album", None)
-        self._emit(
-            "music.playback.started",
-            {
-                "caller": self._caller(),
-                "action": "play_item",
-                "track": track_payload,
-            },
-            source="app://vesper/playback",
-            subject=item_id,
-        )
-        return result
+        return self._playback_ctrl.play_item(item_id, kind=kind, is_library=is_library, track=track)
 
     def play_item_href(self, href: str) -> dict[str, Any]:
-        if not href.strip():
-            raise CiderValidationError("href cannot be empty.")
-        return {"status": "ok", "result": self._rpc.playback_post("/play-item-href", {"href": href})}
+        return self._playback_ctrl.play_item_href(href)
 
     def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> dict[str, Any]:
         return self._search_ctrl.search_catalog(query, limit=limit, storefront=storefront, offset=offset)
