@@ -42,7 +42,6 @@ from .catalog import (
 from .errors import (
     CiderAgentError,
     CiderValidationError,
-    PreferenceStoreError,
     TextRequestExecutionError,
 )
 from .results import EngineActionResult, TextRequestResult
@@ -77,10 +76,11 @@ from .validation import (
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
 # with tests that import it from ``vesper.service``.
-from .utils import _clean_id, _elapsed_ms
+from .utils import _clean_id, _elapsed_ms, _extract_is_playing, _preference_target, _track_payload
 # :class:`vesper.session.SessionEngine` can be imported at module top now that
 # the session modules no longer import from ``vesper.service`` (issue #44).
 from .session import SessionEngine
+from .preference_controller import PreferenceController
 
 
 LOGGER = logging.getLogger(__name__)
@@ -140,6 +140,7 @@ class CiderAgentService:
             resolver=self._resolver,
             settings=self._settings,
         )
+        self._preferences_ctrl = PreferenceController(self, preferences=self._preferences)
         self.reconcile_session_runtime()
 
     @property
@@ -267,37 +268,16 @@ class CiderAgentService:
         )
 
     def _track_payload(self, track: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(track, dict):
-            return None
-        play_params = track.get("play_params", {}) if isinstance(track.get("play_params"), dict) else {}
-        track_id = (
-            _clean_id(track.get("track_id"))
-            or _clean_id(track.get("id"))
-            or _clean_id(play_params.get("id"))
-        )
-        if not track_id and not any(track.get(key) for key in ("title", "artist", "album")):
-            return None
-        return {
-            "id": track_id or None,
-            "title": track.get("title"),
-            "artist": track.get("artist"),
-            "album": track.get("album"),
-            "kind": track.get("kind") or track.get("type") or play_params.get("kind"),
-            "is_library": track.get("is_library")
-            if track.get("is_library") is not None
-            else play_params.get("is_library"),
-        }
+        return _track_payload(track)
 
     def _preference_target(self, preference: dict[str, Any] | None) -> dict[str, Any] | None:
-        if not isinstance(preference, dict):
-            return None
-        return {
-            "track_id": preference.get("track_id"),
-            "title": preference.get("title"),
-            "artist_id": preference.get("artist_id"),
-            "artist_name": preference.get("artist_name"),
-            "album": preference.get("album"),
-        }
+        return _preference_target(preference)
+
+    def _get_active_session(self) -> dict[str, Any] | None:
+        return self._preferences.get_active_session()
+
+    def _current_preference_context_query(self, runtime: dict[str, Any]) -> str | None:
+        return self._session._current_preference_context_query(runtime)
 
     def default_search_source(self) -> str:
         return self._settings.default_search_source
@@ -803,129 +783,15 @@ class CiderAgentService:
         return self._play_flattened_track(items[index], is_library_default=source == "library")
 
     def list_preferences(self) -> dict[str, Any]:
-        preferences = self._preferences.list_preferences()
-        liked_tracks = [item for item in preferences if item.get("preference_type") == "liked_track"]
-        favored_artists = [item for item in preferences if item.get("preference_type") == "favored_artist"]
-        rejected_tracks = [item for item in preferences if item.get("preference_type") == "globally_rejected_track"]
-        return {
-            "status": "ok",
-            "count": len(preferences),
-            "summary": {
-                "liked_tracks": len(liked_tracks),
-                "favored_artists": len(favored_artists),
-                "globally_rejected_tracks": len(rejected_tracks),
-            },
-            "liked_tracks": liked_tracks,
-            "favored_artists": favored_artists,
-            "globally_rejected_tracks": rejected_tracks,
-            "preferences": preferences,
-        }
+        return self._preferences_ctrl.list_preferences()
 
     @_historian_operation
     def forget_preference(self, preference_id: int) -> dict[str, Any]:
-        preference = None
-        try:
-            preference = self._preferences.get_preference(preference_id)
-        except PreferenceStoreError:
-            # ``get_preference`` raises this when the row is missing. We treat
-            # a missing preference as already forgotten (idempotent delete)
-            # and fall through to the delete below, which surfaces a clean
-            # CiderValidationError if the row truly is gone. Unexpected errors
-            # are not caught so they propagate.
-            pass
-        removed = self._preferences.delete_preference(preference_id)
-        if not removed:
-            raise CiderValidationError(f"Preference {preference_id} was not found.")
-        self._emit(
-            "music.preference.forgotten",
-            {
-                "caller": self._caller(),
-                "preference_id": preference_id,
-                "preference_type": preference.get("preference_type") if preference else None,
-                "target": self._preference_target(preference),
-            },
-            source="app://vesper/preferences",
-            subject=str(preference_id),
-        )
-        return {"status": "ok", "removed": True, "preference_id": preference_id}
+        return self._preferences_ctrl.forget_preference(preference_id)
 
     @_historian_operation
     def like_current_track(self) -> dict[str, Any]:
-        playback = self.playback_snapshot()
-        current = playback.get("track", {})
-        current_id = _clean_id(current.get("track_id"))
-        if not current_id:
-            raise CiderValidationError("No current track is available to like.")
-        session = self._preferences.get_active_session()
-        runtime = self._get_session_runtime(session["id"]) if session is not None else {}
-        liked_track = self._preferences.record_liked_track(
-            track_id=current_id,
-            title=str(current.get("title", "")).strip() or None,
-            artist_name=str(current.get("artist", "")).strip() or None,
-            album=str(current.get("album", "")).strip() or None,
-            item_kind=str(current.get("kind", "")).strip() or None,
-            is_library=bool(current.get("is_library")) if current.get("is_library") is not None else None,
-            session_request_text=str(session.get("request_text", "")).strip() or None if session is not None else None,
-            session_search_query=self._session._current_preference_context_query(runtime),
-        )
-        favored_artist = None
-        if str(current.get("artist", "")).strip():
-            favored_artist = self._preferences.record_favored_artist(
-                artist_name=str(current.get("artist", "")).strip(),
-                session_request_text=liked_track.get("session_request_text"),
-                session_search_query=liked_track.get("session_search_query"),
-            )
-        if session is not None:
-            self._preferences.add_session_event(
-                session["id"],
-                event_type="track_liked",
-                track={
-                    "track_id": current_id,
-                    "title": current.get("title"),
-                    "artist": current.get("artist"),
-                    "album": current.get("album"),
-                    "href": None,
-                },
-                metadata={
-                    "session_request_text": liked_track.get("session_request_text"),
-                    "session_search_query": liked_track.get("session_search_query"),
-                },
-            )
-        self._emit(
-            "music.preference.recorded",
-            {
-                "caller": self._caller(),
-                "preference_id": liked_track["id"],
-                "preference_type": liked_track["preference_type"],
-                "polarity": "like",
-                "target": self._preference_target(liked_track),
-                "reason": None,
-            },
-            source="app://vesper/preferences",
-            subject=str(liked_track["id"]),
-            session_id=session["id"] if session else None,
-        )
-        if favored_artist is not None:
-            self._emit(
-                "music.preference.recorded",
-                {
-                    "caller": self._caller(),
-                    "preference_id": favored_artist["id"],
-                    "preference_type": favored_artist["preference_type"],
-                    "polarity": "prefer",
-                    "target": self._preference_target(favored_artist),
-                    "reason": "artist of liked track",
-                },
-                source="app://vesper/preferences",
-                subject=str(favored_artist["id"]),
-                session_id=session["id"] if session else None,
-            )
-        return {
-            "status": "ok",
-            "playback_continues": True,
-            "liked_track": liked_track,
-            "favored_artist": favored_artist,
-        }
+        return self._preferences_ctrl.like_current_track()
 
     def session_status(self, *, include_recent_tracks: bool = True, compact: bool | None = None) -> dict[str, Any]:
         return self._session.session_status(include_recent_tracks=include_recent_tracks, compact=compact)
