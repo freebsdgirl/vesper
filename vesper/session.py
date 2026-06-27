@@ -21,7 +21,7 @@ import threading
 import time
 from typing import Any, Protocol
 
-from .errors import CiderValidationError
+from .errors import CiderAgentError, CiderValidationError
 from .output import compact_output
 from .resolver import SessionQueryPlan, SessionSearchSource
 from .session_queue import SessionQueueMixin
@@ -450,6 +450,15 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                 debug_reason=f"adaptive-session-start: {request.strip()}",
             )
         except Exception as exc:
+            # Broad catch is intentional: session startup touches RPC, resolver,
+            # and preference-store calls, and any failure during startup must
+            # run the abort/cleanup below before re-raising, so we never leave a
+            # half-started session wedged. Domain errors (CiderAgentError and
+            # subclasses) are expected operational failures and are recorded
+            # without a noisy traceback; unexpected errors get a full
+            # ``LOGGER.exception`` so they remain actionable.
+            if not isinstance(exc, CiderAgentError):
+                LOGGER.exception("Unexpected error starting adaptive session.")
             self._abort_failed_session_start(session["id"])
             self._host._emit(
                 "music.session.ended",
@@ -662,6 +671,12 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                     self._host._record_error("worker", "adaptive-session-auto-advance", exc)
                     LOGGER.warning("Adaptive session worker could not advance session: %s", exc)
                 except Exception as exc:
+                    # Broad catch is intentional per the issue's direction #3:
+                    # the background refill loop must stay alive across
+                    # unexpected failures rather than tearing down the worker.
+                    # The full traceback is logged at EXCEPTION level (via
+                    # ``LOGGER.exception``) and the error is recorded, so the
+                    # failure stays actionable without disguising its type.
                     self._host._record_error("worker", "adaptive-session-refill", exc)
                     LOGGER.exception("Adaptive session worker failed during refill loop.")
                 finally:
@@ -800,6 +815,12 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                     result["timings"] = timings
                 return result
             except Exception:
+                # Broad catch is intentional: this is a cleanup-then-reraise
+                # guard, not a recovery point. Any failure (domain or
+                # unexpected) leaving ``_play_session_track`` must clear
+                # ``advance_in_progress`` so the session runtime is never
+                # wedged, then re-raise so the original error propagates
+                # unchanged. See issue #47.
                 self._set_session_runtime(session["id"], advance_in_progress=False, planning_playback_snapshot=None)
                 raise
 

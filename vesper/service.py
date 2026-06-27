@@ -14,6 +14,7 @@ from typing import Any
 
 from .config import Settings
 from .historian import (
+    HistorianDeliveryError,
     HistorianSink,
     NullHistorianSink,
     build_event,
@@ -42,7 +43,13 @@ from .catalog import (
     search_library_tracks as _search_library_tracks_impl,
     track_attributes as _track_attributes,
 )
-from .errors import CiderAgentError, CiderRpcError, CiderValidationError, TextRequestExecutionError
+from .errors import (
+    CiderAgentError,
+    CiderRpcError,
+    CiderValidationError,
+    PreferenceStoreError,
+    TextRequestExecutionError,
+)
 from .results import EngineActionResult, TextRequestResult
 from .resolver import (
     ResolvedAction,
@@ -203,7 +210,11 @@ class CiderAgentService:
         )
         try:
             self._historian.emit(event)
-        except Exception as exc:
+        except HistorianDeliveryError as exc:
+            # Historian delivery is best-effort: a failed delivery must never
+            # fail the surrounding operation. Only the documented delivery
+            # failure is swallowed (with a warning); unexpected sink failures
+            # propagate so they remain visible and actionable.
             LOGGER.warning(
                 "Historian delivery failed for event_id=%s type=%s: %s",
                 event["id"],
@@ -820,7 +831,12 @@ class CiderAgentService:
         preference = None
         try:
             preference = self._preferences.get_preference(preference_id)
-        except Exception:
+        except PreferenceStoreError:
+            # ``get_preference`` raises this when the row is missing. We treat
+            # a missing preference as already forgotten (idempotent delete)
+            # and fall through to the delete below, which surfaces a clean
+            # CiderValidationError if the row truly is gone. Unexpected errors
+            # are not caught so they propagate.
             pass
         removed = self._preferences.delete_preference(preference_id)
         if not removed:

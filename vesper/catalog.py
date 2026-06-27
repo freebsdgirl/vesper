@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from .errors import CiderRpcError
 from .rpc import CiderRpcClient
 
 LOGGER = logging.getLogger(__name__)
@@ -213,7 +214,12 @@ def load_genre_map(
         }
         if len(genre_map) > 50:
             genre_map = {}
-    except Exception as exc:
+    except CiderRpcError as exc:
+        # Genre data is non-essential enrichment used only when resolving
+        # genre-typed session sources. A catalog/RPC failure degrades
+        # gracefully to an empty map (genre sources simply resolve to
+        # nothing) rather than blocking session planning. Unexpected errors
+        # are not caught here so they remain visible and actionable.
         LOGGER.warning("Could not load Apple Music genres for %s: %s", storefront, exc)
         genre_map = {}
     genre_cache[storefront] = genre_map
