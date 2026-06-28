@@ -134,10 +134,13 @@ def list_session_queue(
     limit: int = 50,
     include_history: bool = False,
 ) -> list[dict[str, Any]]:
-    where_state = "" if include_history else "AND state IN ('queued', 'playing')"
-    with connect(database_path) as connection:
-        rows = connection.execute(
-            f"""
+    # Select between two fully static query strings rather than interpolating a
+    # clause into an f-string. Both queries use only bound parameters (?) for
+    # runtime values, so no SQL is ever built from interpolation. If a new
+    # filter is needed, add another static branch here instead of f-stringing a
+    # dynamic fragment (issue #84).
+    if include_history:
+        query = """
             SELECT
                 id,
                 session_id,
@@ -156,12 +159,35 @@ def list_session_queue(
                 updated_at
             FROM session_queue_items
             WHERE session_id = ?
-            {where_state}
             ORDER BY position ASC, id ASC
             LIMIT ?
-            """,
-            (session_id, limit),
-        ).fetchall()
+            """
+    else:
+        query = """
+            SELECT
+                id,
+                session_id,
+                position,
+                source_kind,
+                source_term,
+                source_key,
+                track_id,
+                title,
+                artist,
+                album,
+                href,
+                track_json,
+                state,
+                created_at,
+                updated_at
+            FROM session_queue_items
+            WHERE session_id = ?
+            AND state IN ('queued', 'playing')
+            ORDER BY position ASC, id ASC
+            LIMIT ?
+            """
+    with connect(database_path) as connection:
+        rows = connection.execute(query, (session_id, limit)).fetchall()
     return [_decode_session_queue_row(row) for row in rows]
 
 

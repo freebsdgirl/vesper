@@ -80,6 +80,43 @@ def test_session_queue_round_trip_and_claim(settings) -> None:
     assert [item["state"] for item in queued] == ["played", "rejected"]
 
 
+def test_list_session_queue_state_filter_excludes_terminal_states(settings) -> None:
+    # list_session_queue() must only return active items (queued/playing) unless
+    # include_history=True is requested. Guards the state-filter branch in
+    # list_session_queue, which was previously built via f-string interpolation
+    # (issue #84).
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play upbeat music")
+
+    store.replace_session_queue(
+        session["id"],
+        [
+            {
+                "source": {"kind": "legacy", "term": "wide"},
+                "source_key": "wide",
+                "track": {"id": f"track-{i}", "title": f"Title {i}"},
+            }
+            for i in range(1, 5)
+        ],
+    )
+
+    # track-1 -> playing (claimed), then marked played (terminal).
+    first = store.claim_next_session_queue_item(session["id"])
+    assert first is not None
+    assert first["track_id"] == "track-1"
+    store.mark_session_queue_item(first["id"], "played")
+    # track-4 -> rejected (terminal). track-2 and track-3 stay queued.
+    store.mark_session_queue_track(session["id"], "track-4", "rejected")
+
+    active = store.list_session_queue(session["id"])
+    assert [item["track_id"] for item in active] == ["track-2", "track-3"]
+    assert [item["state"] for item in active] == ["queued", "queued"]
+
+    history = store.list_session_queue(session["id"], include_history=True)
+    assert [item["track_id"] for item in history] == ["track-1", "track-2", "track-3", "track-4"]
+    assert [item["state"] for item in history] == ["played", "queued", "queued", "rejected"]
+
+
 def test_reset_stale_session_queue_items(settings) -> None:
     store = PreferenceStore(settings.database_path)
     session = store.start_session(request_text="play upbeat music")
