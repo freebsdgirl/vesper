@@ -6,6 +6,7 @@ import argparse
 from contextlib import nullcontext
 import json
 import sys
+from pathlib import Path
 from typing import Any
 
 from .app import get_settings, service_context
@@ -54,6 +55,12 @@ def _build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--a2a", action="store_true", help="Enable the A2A HTTP transport.")
     serve.add_argument("--mcp", action="store_true", help="Enable the MCP Streamable HTTP transport at /mcp.")
 
+    config = subparsers.add_parser("config", help="Manage Vesper configuration.")
+    config_subparsers = config.add_subparsers(dest="config_command", required=True)
+    config_init = config_subparsers.add_parser("init", help="Write a default config file from the packaged template.")
+    config_init.add_argument("--path", type=Path, default=None, help="Config file path (default: ~/.config/vesper/config.json).")
+    config_init.add_argument("--force", action="store_true", help="Overwrite an existing config file.")
+
     return parser
 def main() -> None:
     parser = _build_parser()
@@ -79,6 +86,12 @@ def main() -> None:
             from .mcp_server import create_mcp_server
 
             create_mcp_server().run("stdio")
+            return
+        if args.command == "config" and args.config_command == "init":
+            from .config import write_default_config
+
+            path = write_default_config(args.path, force=args.force)
+            print(f"Wrote config to {path}")
             return
 
         with service_context() as service:

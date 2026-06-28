@@ -100,3 +100,86 @@ def test_unknown_config_fields_are_rejected(tmp_path, monkeypatch) -> None:
 
     with pytest.raises(CiderConfigError, match="Unknown config fields: typo_setting"):
         Settings.from_env()
+
+
+def test_write_default_config_writes_template(tmp_path) -> None:
+    from importlib.resources import files
+
+    from vesper.config import write_default_config
+
+    target = tmp_path / "vesper" / "config.json"
+    written = write_default_config(target)
+
+    assert written == target
+    assert target.exists()
+    expected = files("vesper").joinpath("config.example.json").read_text(encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == expected
+
+
+def test_write_default_config_creates_parent_dirs(tmp_path) -> None:
+    from vesper.config import write_default_config
+
+    target = tmp_path / "nested" / "deeper" / "config.json"
+    write_default_config(target)
+    assert target.exists()
+
+
+def test_write_default_config_refuses_overwrite(tmp_path) -> None:
+    from vesper.config import write_default_config
+
+    target = tmp_path / "config.json"
+    target.write_text("EXISTING", encoding="utf-8")
+
+    with pytest.raises(CiderConfigError, match="already exists"):
+        write_default_config(target)
+
+    # Untouched when refused.
+    assert target.read_text(encoding="utf-8") == "EXISTING"
+
+
+def test_write_default_config_force_overwrites(tmp_path) -> None:
+    from importlib.resources import files
+
+    from vesper.config import write_default_config
+
+    target = tmp_path / "config.json"
+    target.write_text("EXISTING", encoding="utf-8")
+
+    write_default_config(target, force=True)
+
+    expected = files("vesper").joinpath("config.example.json").read_text(encoding="utf-8")
+    assert target.read_text(encoding="utf-8") == expected
+
+
+def test_default_config_path_respects_xdg_config_home(tmp_path, monkeypatch) -> None:
+    from vesper.config import default_config_path
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert default_config_path() == tmp_path / "vesper" / "config.json"
+
+
+def test_write_default_config_default_target_writes_template(tmp_path, monkeypatch) -> None:
+    from importlib.resources import files
+
+    from vesper.config import write_default_config
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    written = write_default_config()  # no explicit target -> XDG default
+
+    assert written == tmp_path / "vesper" / "config.json"
+    expected = files("vesper").joinpath("config.example.json").read_text(encoding="utf-8")
+    assert written.read_text(encoding="utf-8") == expected
+
+
+def test_write_default_config_permission_error_is_cider_config_error(tmp_path) -> None:
+    from vesper.config import write_default_config
+
+    target = tmp_path / "nope" / "config.json"
+    # Make the parent unwritable so mkdir or write raises OSError.
+    target.parent.mkdir()
+    target.parent.chmod(0o400)
+    try:
+        with pytest.raises(CiderConfigError, match="Could not access or write"):
+            write_default_config(target)
+    finally:
+        target.parent.chmod(0o700)
