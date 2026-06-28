@@ -18,7 +18,8 @@ service class.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Protocol
 
 from .catalog import (
@@ -69,6 +70,10 @@ class PlaybackController:
     # every call to this hot path. See #67.
     _POOL_WORKERS = 14
 
+    # Per-future timeout when draining in-flight snapshots in close(). Bounded
+    # so a hung RPC can't block close() indefinitely (issue #89).
+    _CLOSE_DRAIN_TIMEOUT_SECONDS = 5.0
+
     def __init__(
         self,
         host: PlaybackHost,
@@ -84,10 +89,30 @@ class PlaybackController:
         self._executor = ThreadPoolExecutor(
             max_workers=self._POOL_WORKERS, thread_name_prefix="playback-snapshot"
         )
+        # In-flight snapshot futures, guarded by _pending_lock so close() can
+        # drain a consistent set while playback_snapshot() submits new work.
+        # See #89.
+        self._pending_futures: set[Future[Any]] = set()
+        self._pending_lock = threading.Lock()
 
     def close(self) -> None:
-        """Release the shared snapshot thread pool. Idempotent."""
-        self._executor.shutdown(wait=False)
+        """Release the shared snapshot thread pool. Idempotent.
+
+        Signals the pool to stop accepting work, then waits a bounded time for
+        any in-flight playback_snapshot() fan-out to finish so worker threads
+        are not orphaned and can't raise at interpreter shutdown (issue #89).
+        """
+        # Stop accepting new submissions first. cancel_futures=True (3.9+)
+        # drops not-yet-started tasks; started ones still run to completion.
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        with self._pending_lock:
+            pending = list(self._pending_futures)
+        # Drain in-flight tasks with a short bounded timeout per future. If a
+        # snapshot RPC hangs, we don't block close() indefinitely — the worker
+        # is a daemon thread and won't block interpreter exit, but we give
+        # well-behaved tasks a chance to complete.
+        for future in pending:
+            future.result(timeout=self._CLOSE_DRAIN_TIMEOUT_SECONDS)
 
     def status(self) -> dict[str, Any]:
         playback = self.playback_snapshot()
@@ -152,11 +177,19 @@ class PlaybackController:
         # Fan out the 7 playback reads on the reused instance pool rather than
         # creating a ThreadPoolExecutor per call. Each future's result() is
         # awaited below, so all submissions complete before we return. See #67.
+        # Futures are registered in _pending_futures so close() can drain them
+        # if it runs while this fan-out is in flight (issue #89).
         futures = {
             name: self._executor.submit(self._rpc.playback_get, path)
             for name, path in snapshot_paths.items()
         }
-        payloads = {name: future.result() for name, future in futures.items()}
+        with self._pending_lock:
+            self._pending_futures.update(futures.values())
+        try:
+            payloads = {name: future.result() for name, future in futures.items()}
+        finally:
+            with self._pending_lock:
+                self._pending_futures.difference_update(futures.values())
         is_playing_payload = payloads["is_playing"]
         now_playing_payload = payloads["now_playing"]
         volume_payload = payloads["volume"]
