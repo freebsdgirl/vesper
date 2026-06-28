@@ -412,7 +412,7 @@ def create_http_app(*, include_a2a: bool = False, include_mcp: bool = False) -> 
         mcp_app = mcp_server.streamable_http_app()
         mcp_endpoint = cast(Route, mcp_app.routes[0]).endpoint
 
-    app = FastAPI(title="Vesper", version="0.1.0", lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
+    app = FastAPI(title="Vesper", version=__version__, lifespan=_create_lifespan(mcp_server.session_manager if mcp_server else None))
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
