@@ -61,6 +61,14 @@ class PlaybackHost(Protocol):
 class PlaybackController:
     """Pure RPC playback operations: volume, queue, transport, snapshot."""
 
+    # Each playback_snapshot fans out 7 concurrent RPC reads. The instance
+    # pool is sized to allow two overlapping snapshots (e.g. a request handler
+    # and the background session worker advancing in parallel) without
+    # contending on a single snapshot's worth of workers, while bounding the
+    # thread count. Reusing one pool avoids creating/destroying 7 threads on
+    # every call to this hot path. See #67.
+    _POOL_WORKERS = 14
+
     def __init__(
         self,
         host: PlaybackHost,
@@ -73,6 +81,13 @@ class PlaybackController:
         self._rpc = rpc
         self._preferences = preferences
         self._settings = settings
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._POOL_WORKERS, thread_name_prefix="playback-snapshot"
+        )
+
+    def close(self) -> None:
+        """Release the shared snapshot thread pool. Idempotent."""
+        self._executor.shutdown(wait=False)
 
     def status(self) -> dict[str, Any]:
         playback = self.playback_snapshot()
@@ -134,13 +149,14 @@ class PlaybackController:
             "shuffle": "/shuffle-mode",
             "autoplay": "/autoplay",
         }
-        with ThreadPoolExecutor(max_workers=len(snapshot_paths)) as executor:
-            payloads = {
-                name: future.result()
-                for name, future in {
-                    name: executor.submit(self._rpc.playback_get, path) for name, path in snapshot_paths.items()
-                }.items()
-            }
+        # Fan out the 7 playback reads on the reused instance pool rather than
+        # creating a ThreadPoolExecutor per call. Each future's result() is
+        # awaited below, so all submissions complete before we return. See #67.
+        futures = {
+            name: self._executor.submit(self._rpc.playback_get, path)
+            for name, path in snapshot_paths.items()
+        }
+        payloads = {name: future.result() for name, future in futures.items()}
         is_playing_payload = payloads["is_playing"]
         now_playing_payload = payloads["now_playing"]
         volume_payload = payloads["volume"]

@@ -1639,6 +1639,31 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
     assert rpc.playback_get_calls.count("/queue") == 1
 
 
+def test_playback_snapshot_reuses_instance_thread_pool(service) -> None:
+    # playback_snapshot must fan out its 7 reads on a single reused
+    # instance-level pool, not create a ThreadPoolExecutor per call. See #67.
+    executor_before = service._playback_ctrl._executor
+
+    service._rpc.playback_get_calls.clear()
+    service.playback_snapshot()
+
+    # All seven snapshot paths are fetched exactly once per call.
+    expected_paths = {
+        "/is-playing",
+        "/now-playing",
+        "/volume",
+        "/queue",
+        "/repeat-mode",
+        "/shuffle-mode",
+        "/autoplay",
+    }
+    assert set(service._rpc.playback_get_calls) == expected_paths
+
+    # A second call reuses the same pool instance.
+    service.playback_snapshot()
+    assert service._playback_ctrl._executor is executor_before
+
+
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
     class RawStubResolver:
         def resolve(self, text: str, service) -> ResolvedAction:
@@ -2156,6 +2181,7 @@ def test_close_drains_worker_before_closing_clients(service, monkeypatch) -> Non
         original_stop(timeout=timeout)
 
     monkeypatch.setattr(service, "stop_background_session_worker", spy_stop)
+    monkeypatch.setattr(service._playback_ctrl, "close", lambda: order.append("playback_close"))
     monkeypatch.setattr(service._rpc, "close", lambda: order.append("rpc_close"))
     monkeypatch.setattr(service._resolver, "close", lambda: order.append("resolver_close"), raising=False)
     monkeypatch.setattr(service._historian, "close", lambda: order.append("historian_close"))
@@ -2164,8 +2190,10 @@ def test_close_drains_worker_before_closing_clients(service, monkeypatch) -> Non
 
     # The worker must be stopped (and joined) before any client is torn down,
     # and close() must give the worker a join window that covers one in-flight
-    # request (request_timeout_seconds). See #4.
-    assert order == ["stop_worker", "rpc_close", "resolver_close", "historian_close"]
+    # request (request_timeout_seconds). See #4. The reused playback snapshot
+    # thread pool is shut down after the worker (its only remaining user) but
+    # before the RPC client. See #67.
+    assert order == ["stop_worker", "playback_close", "rpc_close", "resolver_close", "historian_close"]
     assert seen_timeout["timeout"] == service._settings.request_timeout_seconds
 
 

@@ -396,12 +396,17 @@ def settings(tmp_path: Path) -> Settings:
 
 @pytest.fixture
 def service(settings: Settings) -> CiderAgentService:
-    return CiderAgentService(
+    svc = CiderAgentService(
         settings,
         rpc_client=StubRpcClient(),
         preference_store=PreferenceStore(settings.database_path),
         resolver=StubResolver(),
     )
+    yield svc
+    # Shut down the reused playback snapshot thread pool (issue #67) so its
+    # worker threads don't accumulate across the many tests using this fixture.
+    # The full service.close() is exercised by the dedicated teardown tests.
+    svc._playback_ctrl.close()
 
 
 @pytest.fixture

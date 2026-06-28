@@ -105,6 +105,10 @@ class CiderAgentService:
         # RPC client, resolver, and historian. Otherwise close() can close the
         # very clients the worker thread is still using mid-advance. See #4.
         self.stop_background_session_worker(timeout=self._settings.request_timeout_seconds)
+        # Release the reused playback snapshot thread pool now that the
+        # background worker (which fans out playback reads through it) has
+        # stopped. See #67.
+        self._playback_ctrl.close()
         self._rpc.close()
         close = getattr(self._resolver, "close", None)
         if callable(close):
