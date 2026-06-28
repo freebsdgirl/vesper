@@ -100,6 +100,18 @@ def test_agent_card_alias_is_published(monkeypatch, service, settings) -> None:
     assert payload["skills"][0]["inputModes"] == ["text/plain"]
 
 
+def test_agent_card_version_matches_package_metadata(monkeypatch, service, settings) -> None:
+    # The agent card version must track the package version instead of a
+    # hard-coded literal that can drift from pyproject.toml (issue #88).
+    from vesper import __version__
+
+    response = asyncio.run(_request(_app(monkeypatch, service, settings), "GET", "/.well-known/agent-card.json"))
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["version"] == __version__
+
+
 def test_agent_json_alias_is_removed(monkeypatch, service, settings) -> None:
     response = asyncio.run(_request(_app(monkeypatch, service, settings), "GET", "/.well-known/agent.json"))
 
