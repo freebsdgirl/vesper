@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 import sys
 from typing import Any
@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from vesper.config import Settings
 from vesper.rpc import CiderRpcClient
-from vesper.resolver import ResolvedAction, SessionQueryPlan, SessionSearchSource
+from vesper.resolver import FallbackResolver, ResolvedAction, SessionQueryPlan, SessionSearchSource
 from vesper.service import CiderAgentService
 from vesper.storage import PreferenceStore, close_connections, close_lifecycle_locks
 
@@ -48,7 +48,7 @@ class StubRpcClient:
     def __init__(self) -> None:
         self.is_playing = True
         self.volume = 0.5
-        self.current_track = self._track(
+        self.current_track: dict[str, Any] | None = self._track(
             "track-1",
             "Track",
             "Artist",
@@ -82,6 +82,9 @@ class StubRpcClient:
         }
 
     def close(self) -> None:
+        return None
+
+    def set_failure_callback(self, callback) -> None:
         return None
 
     def playback_get(self, path: str):
@@ -132,7 +135,7 @@ class StubRpcClient:
         }
         return catalog_map.get(item_id, self._track(item_id or "unknown-track", item_id or "Unknown"))
 
-    def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0):
         self.search_catalog_calls.append({"query": query, "limit": limit, "storefront": storefront, "offset": offset})
         if query == "Favorite Artist Liked Song":
             return {
@@ -238,7 +241,7 @@ class StubRpcClient:
             }
         }
 
-    def search_library(self, query: str, *, limit: int, types: list[str] | None = None):
+    def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None):
         return {
             "data": {
                 "results": {
@@ -312,7 +315,7 @@ class StubRpcClient:
         return {"data": {"data": [{"id": "playlist-1", "type": "library-playlists", "attributes": {"name": "Mix"}}]}}
 
 
-class StubResolver:
+class StubResolver(FallbackResolver):
     def __init__(self) -> None:
         self.session_plan_calls = 0
 
@@ -395,7 +398,7 @@ def settings(tmp_path: Path) -> Settings:
 
 
 @pytest.fixture
-def service(settings: Settings) -> CiderAgentService:
+def service(settings: Settings) -> Iterator[CiderAgentService]:
     svc = CiderAgentService(
         settings,
         rpc_client=StubRpcClient(),

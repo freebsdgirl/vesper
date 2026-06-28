@@ -45,10 +45,14 @@ def test_artist_source_uses_exact_artist_and_top_songs(service, monkeypatch) -> 
 def test_genre_source_resolves_exact_cached_genre_and_chart(service, monkeypatch) -> None:
     paths: list[str] = []
     monkeypatch.setattr(service, "_load_genre_map", lambda storefront="us": {"Pop": "14"})
+    def _capture_catalog_relationship_tracks(path, storefront="us"):
+        paths.append(path)
+        return [_track("pop-1", "Pop Song", "Artist")]
+
     monkeypatch.setattr(
         service,
         "_catalog_relationship_tracks",
-        lambda path, storefront="us": paths.append(path) or [_track("pop-1", "Pop Song", "Artist")],
+        _capture_catalog_relationship_tracks,
     )
 
     pool = service._session._build_session_query_pool({"id": 1}, SessionSearchSource(kind="genre", term="Pop"))

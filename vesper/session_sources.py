@@ -223,7 +223,7 @@ class SessionSourcesMixin:
                 excluded.add(track_id)
         return excluded
 
-    def _build_session_query_pool(self, session: dict[str, Any], source: SessionSearchSource) -> dict[str, Any]:
+    def _build_session_query_pool(self, session: dict[str, Any], source: str | SessionSearchSource) -> dict[str, Any]:
         if isinstance(source, str):
             source = SessionSearchSource(kind="legacy", term=source)
         raw_tracks, metadata = self._host._fetch_session_source_results(session, source)

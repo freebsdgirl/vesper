@@ -28,6 +28,7 @@ from .catalog import (
 )
 from .errors import CiderValidationError
 from .output import compact_track
+from .rpc import RpcClient
 from .storage import PreferenceStore
 from .utils import _extract_is_playing, _track_payload
 from .validation import validate_index
@@ -78,7 +79,7 @@ class PlaybackController:
         self,
         host: PlaybackHost,
         *,
-        rpc,
+        rpc: RpcClient,
         preferences: PreferenceStore,
         settings,
     ) -> None:

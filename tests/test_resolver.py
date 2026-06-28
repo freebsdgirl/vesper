@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import httpx
 import pytest
@@ -1396,7 +1397,7 @@ def test_filter_session_queue_parses_eligible_indices_and_policy(settings: Setti
 
 
 def test_session_plan_prompt_omits_recent_track_history(settings: Settings, service) -> None:
-    captured_payload: dict[str, object] = {}
+    captured_payload: dict[str, Any] = {}
 
     resolver_settings = Settings(
         http_host=settings.http_host,

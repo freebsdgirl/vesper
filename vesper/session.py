@@ -24,6 +24,7 @@ from typing import Any, Protocol
 from .errors import CiderAgentError, CiderValidationError
 from .output import compact_output
 from .resolver import Resolver, SessionQueryPlan, SessionSearchSource
+from .rpc import RpcClient
 from .session_queue import SessionQueueMixin
 from .session_runtime import SessionRuntimeMixin
 from .session_sources import SessionSourcesMixin
@@ -199,7 +200,7 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
     exactly as before extraction.
     """
 
-    def __init__(self, host: SessionHost, *, rpc, preferences, resolver, settings) -> None:
+    def __init__(self, host: SessionHost, *, rpc: RpcClient, preferences, resolver: Resolver, settings) -> None:
         self._host = host
         self._rpc = rpc
         self._preferences = preferences

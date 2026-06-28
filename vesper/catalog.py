@@ -15,7 +15,7 @@ import logging
 from typing import Any
 
 from .errors import CiderRpcError
-from .rpc import CiderRpcClient, _sanitize_storefront
+from .rpc import RpcClient, _sanitize_storefront
 
 LOGGER = logging.getLogger(__name__)
 
@@ -118,7 +118,7 @@ def flatten_album_item(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def search_catalog(
-    rpc: CiderRpcClient,
+    rpc: RpcClient,
     query: str,
     *,
     limit: int = 10,
@@ -139,7 +139,7 @@ def search_catalog(
 
 
 def catalog_resource_search(
-    rpc: CiderRpcClient,
+    rpc: RpcClient,
     query: str,
     *,
     resource_type: str,
@@ -159,7 +159,7 @@ def catalog_resource_search(
 
 
 def catalog_relationship_tracks(
-    rpc: CiderRpcClient,
+    rpc: RpcClient,
     path: str,
     *,
     result_limit: int,
@@ -197,7 +197,7 @@ def catalog_relationship_tracks(
 
 
 def load_genre_map(
-    rpc: CiderRpcClient,
+    rpc: RpcClient,
     genre_cache: dict[str, dict[str, str]],
     storefront: str = SESSION_STOREFRONT,
 ) -> dict[str, str]:
@@ -230,7 +230,7 @@ def load_genre_map(
 
 
 def search_library(
-    rpc: CiderRpcClient,
+    rpc: RpcClient,
     query: str,
     *,
     limit: int = 10,
@@ -260,7 +260,7 @@ def search_library(
     }
 
 
-def search_library_tracks(rpc: CiderRpcClient, query: str, *, limit: int = 10) -> dict[str, Any]:
+def search_library_tracks(rpc: RpcClient, query: str, *, limit: int = 10) -> dict[str, Any]:
     from urllib.parse import quote
 
     payload = rpc.run_amapi_v3(f"/v1/me/library/search?term={quote(query, safe='')}&types=library-songs&limit={limit}")
@@ -274,7 +274,7 @@ def search_library_tracks(rpc: CiderRpcClient, query: str, *, limit: int = 10) -
     }
 
 
-def list_library_playlists(rpc: CiderRpcClient, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
+def list_library_playlists(rpc: RpcClient, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
     path = f"/v1/me/library/playlists?limit={limit}"
     if offset:
         path = f"{path}&offset={offset}"
@@ -289,7 +289,7 @@ def list_library_playlists(rpc: CiderRpcClient, *, limit: int = 25, offset: int 
     }
 
 
-def search_library_playlists(rpc: CiderRpcClient, query: str, *, limit: int = 10) -> dict[str, Any]:
+def search_library_playlists(rpc: RpcClient, query: str, *, limit: int = 10) -> dict[str, Any]:
     from urllib.parse import quote
 
     payload = rpc.run_amapi_v3(
@@ -305,7 +305,7 @@ def search_library_playlists(rpc: CiderRpcClient, query: str, *, limit: int = 10
     }
 
 
-def get_library_playlist(rpc: CiderRpcClient, playlist_id: str) -> dict[str, Any]:
+def get_library_playlist(rpc: RpcClient, playlist_id: str) -> dict[str, Any]:
     payload = rpc.run_amapi_v3(f"/v1/me/library/playlists/{playlist_id}")
     items = payload.get("data", {}).get("data", [])
     playlist = items[0] if isinstance(items, list) and items else {}
@@ -316,7 +316,7 @@ def get_library_playlist(rpc: CiderRpcClient, playlist_id: str) -> dict[str, Any
     }
 
 
-def get_library_playlist_tracks(rpc: CiderRpcClient, playlist_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
+def get_library_playlist_tracks(rpc: RpcClient, playlist_id: str, *, limit: int = 100, offset: int = 0) -> dict[str, Any]:
     path = f"/v1/me/library/playlists/{playlist_id}/tracks?limit={limit}"
     if offset:
         path = f"{path}&offset={offset}"
@@ -331,7 +331,7 @@ def get_library_playlist_tracks(rpc: CiderRpcClient, playlist_id: str, *, limit:
     }
 
 
-def list_recently_played(rpc: CiderRpcClient, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
+def list_recently_played(rpc: RpcClient, *, limit: int = 25, offset: int = 0) -> dict[str, Any]:
     path = f"/v1/me/recent/played/tracks?limit={limit}"
     if offset:
         path = f"{path}&offset={offset}"

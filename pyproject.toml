@@ -21,6 +21,7 @@ dev = [
   "mypy>=1.0",
   "ruff>=0.6",
   "types-protobuf",
+  "types-jsonschema",
 ]
 
 [project.scripts]

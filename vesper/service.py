@@ -16,7 +16,7 @@ from .resolver import (
     SessionSearchSource,
     build_resolver,
 )
-from .rpc import CiderRpcClient
+from .rpc import CiderRpcClient, RpcClient
 from .storage import PreferenceStore, close_connections, close_lifecycle_locks
 # Shared helpers live in :mod:`vesper.utils` to avoid a circular import with the
 # session layer (issue #44). ``_clean_id`` is re-exported here for back-compat
@@ -61,7 +61,7 @@ class CiderAgentService:
         self,
         settings: Settings,
         *,
-        rpc_client: CiderRpcClient | None = None,
+        rpc_client: RpcClient | None = None,
         preference_store: PreferenceStore | None = None,
         resolver: Resolver | None = None,
         historian_sink: HistorianSink | None = None,

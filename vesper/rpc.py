@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 from urllib.parse import quote
 
 import httpx
@@ -42,13 +42,55 @@ class _TransientRequestError(Exception):
         self.detail = detail
 
 
+class RpcSession(Protocol):
+    """Structural interface for the transport used by :class:`CiderRpcClient`.
+
+    Production uses :class:`httpx.Client`; tests substitute lightweight
+    fakes that only need ``request`` and ``close``.
+    """
+
+    def request(self, method: str, path: str, *, headers: dict[str, str], json: Any) -> Any: ...
+
+    def close(self) -> None: ...
+
+
+class RpcClient(Protocol):
+    """Structural interface for the Cider RPC client.
+
+    ``CiderRpcClient`` is the production implementation; test doubles only
+    need to satisfy this protocol. The methods mirror what
+    :class:`~vesper.catalog` and the playback/search/session controllers
+    actually call.
+    """
+
+    def close(self) -> None: ...
+
+    def set_failure_callback(self, callback: Callable[[dict[str, Any]], None] | None) -> None: ...
+
+    def playback_get(self, path: str) -> Any: ...
+
+    def playback_post(self, path: str, body: dict[str, Any] | None = None) -> Any: ...
+
+    def run_amapi_v3(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        body: dict[str, Any] | None = None,
+    ) -> Any: ...
+
+    def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0) -> Any: ...
+
+    def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None) -> Any: ...
+
+
 class CiderRpcClient:
     """HTTP client wrapper around Cider's local RPC API."""
 
     def __init__(
         self,
         settings: Settings,
-        session: httpx.Client | None = None,
+        session: RpcSession | None = None,
         failure_callback: Callable[[dict[str, Any]], None] | None = None,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:

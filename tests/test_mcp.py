@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
 
 import anyio
 import httpx
@@ -75,8 +76,12 @@ def test_mcp_transport_tools_delegate_to_service(monkeypatch, tmp_path: Path) ->
 
             assert play.structuredContent == {"status": "ok", "result": {"path": "/play", "body": None}}
             assert pause.structuredContent == {"status": "ok", "result": {"path": "/pause", "body": None}}
-            assert next_track.structuredContent["result"]["path"] == "/next"
-            assert previous.structuredContent["result"]["path"] == "/previous"
+            next_content = next_track.structuredContent
+            assert next_content is not None
+            assert next_content["result"]["path"] == "/next"
+            prev_content = previous.structuredContent
+            assert prev_content is not None
+            assert prev_content["result"]["path"] == "/previous"
 
     anyio.run(_exercise)
 
@@ -90,9 +95,11 @@ def test_mcp_ask_returns_text_request_payload(monkeypatch, tmp_path: Path) -> No
         async with create_connected_server_and_client_session(mcp_server.create_mcp_server()) as session:
             result = await session.call_tool("ask", {"text": "play some kep1er"})
             assert result.isError is False
-            assert result.structuredContent["status"] == "ok"
-            assert result.structuredContent["input"] == "play some kep1er"
-            assert result.structuredContent["execution"]["action"] == "search"
+            content = result.structuredContent
+            assert content is not None
+            assert content["status"] == "ok"
+            assert content["input"] == "play some kep1er"
+            assert content["execution"]["action"] == "search"
 
     anyio.run(_exercise)
 
@@ -106,7 +113,7 @@ def test_mcp_ask_rejects_empty_text(monkeypatch, tmp_path: Path) -> None:
         async with create_connected_server_and_client_session(mcp_server.create_mcp_server()) as session:
             result = await session.call_tool("ask", {"text": ""})
             assert result.isError is True
-            assert "text cannot be empty" in result.content[0].text
+            assert "text cannot be empty" in cast(Any, result.content[0]).text
 
     anyio.run(_exercise)
 
@@ -184,7 +191,9 @@ def test_streamable_http_client_can_call_mounted_mcp(monkeypatch, tmp_path: Path
                     tools = await session.list_tools()
                     result = await session.call_tool("play", {})
                     assert [tool.name for tool in tools.tools] == ["play", "pause", "next", "previous", "ask"]
-                    assert result.structuredContent["result"]["path"] == "/play"
+                    play_content = result.structuredContent
+                    assert play_content is not None
+                    assert play_content["result"]["path"] == "/play"
 
     anyio.run(_exercise)
 

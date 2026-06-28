@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import threading
+from typing import Any, cast
 
 import pytest
 
 from vesper.action_registry import get_action_definition
 from vesper.config import Settings
 from vesper.errors import CiderValidationError, TextRequestExecutionError
-from vesper.resolver import ResolvedAction
+from vesper.resolver import FallbackResolver, ResolvedAction
 from vesper.service import CiderAgentService
 from vesper.session import SessionWorkerCancelled
 from vesper.storage import PreferenceStore
@@ -192,7 +193,7 @@ def test_handle_text_request_writes_resolver_debug_log(settings, service, tmp_pa
         config_path=settings.config_path,
     )
 
-    class LoggingResolver:
+    class LoggingResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             service.append_resolver_debug_log(
                 stage="resolve_text_request",
@@ -445,7 +446,9 @@ def test_session_runtime_timestamps_are_utc_wall_clock_not_monotonic(service) ->
     ts = service.current_timestamp()
     parsed = datetime.fromisoformat(ts)
     assert parsed.tzinfo is not None
-    assert parsed.utcoffset().total_seconds() == 0
+    utcoffset = parsed.utcoffset()
+    assert utcoffset is not None
+    assert utcoffset.total_seconds() == 0
     assert ts.endswith("+00:00")
 
     # Numeric / monotonic values are rejected outright (no monotonic branch).
@@ -506,7 +509,9 @@ def test_pending_stop_confirmation_persists_across_process_restart(settings, ser
     # The first process observes one stopped snapshot: it arms and PERSISTS the
     # pending confirmation, so it must not advance yet.
     assert first._session._should_advance_session(session, first.playback_snapshot()) is False
-    assert first._preferences.get_session_runtime(session["id"])["pending_stop_track_id"] == "<missing>"
+    first_runtime = first._preferences.get_session_runtime(session["id"])
+    assert first_runtime is not None
+    assert first_runtime["pending_stop_track_id"] == "<missing>"
 
     # A fresh process on the same database must observe the armed confirmation
     # and confirm on its very first stopped snapshot instead of re-arming.
@@ -550,7 +555,9 @@ def test_preference_store_backfills_pending_stop_columns(tmp_path) -> None:
     assert runtime["pending_stop_observed_at"] is None
 
     store.update_session_pending_stop(1, track_id="<missing>", observed_at="2026-01-01T00:00:00+00:00")
-    assert store.get_session_runtime(1)["pending_stop_track_id"] == "<missing>"
+    store_runtime = store.get_session_runtime(1)
+    assert store_runtime is not None
+    assert store_runtime["pending_stop_track_id"] == "<missing>"
 
 
 def test_active_session_reconcile_tolerates_empty_now_playing_info_list(settings, service) -> None:
@@ -807,7 +814,7 @@ def test_global_rejects_are_excluded_from_new_session_caches(service) -> None:
 
 
 def test_failed_session_start_does_not_leave_active_session(settings, service, tmp_path) -> None:
-    class NoMatchResolver:
+    class NoMatchResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -859,7 +866,7 @@ def test_failed_session_start_does_not_leave_active_session(settings, service, t
 
 
 def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_path) -> None:
-    class RepeatingPlanResolver:
+    class RepeatingPlanResolver(FallbackResolver):
         def __init__(self) -> None:
             self.plan_calls = 0
 
@@ -921,7 +928,7 @@ def test_new_session_avoids_recent_global_starter_track(settings, service, tmp_p
 
 
 def test_new_query_pools_apply_global_recent_history_only_at_build_time(settings, service, tmp_path) -> None:
-    class SameTrackResolver:
+    class SameTrackResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -971,7 +978,7 @@ def test_new_query_pools_apply_global_recent_history_only_at_build_time(settings
     first = pool_service.play_session("play upbeat music")
     assert first["result"]["tracks"][0]["title"] == "Liked Song"
     pool_service.stop_session()
-    pool_service._rpc.current_track = None
+    cast(Any, pool_service._rpc).current_track = None
 
     session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
     built_pool = pool_service._session._build_session_query_pool(session, "Favorite Artist Liked Song")
@@ -979,7 +986,7 @@ def test_new_query_pools_apply_global_recent_history_only_at_build_time(settings
 
 
 def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(settings, service, tmp_path) -> None:
-    class SameTrackResolver:
+    class SameTrackResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1028,7 +1035,7 @@ def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(sett
     first = pool_service.play_session("play upbeat music")
     assert first["result"]["tracks"][0]["title"] == "Liked Song"
     pool_service.stop_session()
-    pool_service._rpc.current_track = None
+    cast(Any, pool_service._rpc).current_track = None
 
     session = {"id": 999, "request_text": "play upbeat music", "steering_history": []}
     built_pool = pool_service._session._build_session_query_pool(session, "Favorite Artist Liked Song")
@@ -1037,7 +1044,7 @@ def test_new_query_pool_relaxes_global_recent_filter_when_it_would_be_empty(sett
 
 
 def test_materialized_session_queue_reuses_large_result_pool_without_requerying(service) -> None:
-    class QueueResolver:
+    class QueueResolver(FallbackResolver):
         def __init__(self) -> None:
             self.selection_calls = 0
 
@@ -1080,6 +1087,9 @@ def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings,
         def close(self) -> None:
             return None
 
+        def set_failure_callback(self, callback) -> None:
+            return None
+
         def playback_get(self, path: str):
             if path == "/now-playing":
                 return {"info": {}}
@@ -1100,7 +1110,7 @@ def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings,
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+        def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0):
             self.search_calls.append({"limit": limit, "offset": offset})
             songs = [
                 {
@@ -1121,13 +1131,13 @@ def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings,
             ]
             return {"data": {"results": {"songs": {"data": songs}}}}
 
-        def search_library(self, query: str, *, limit: int, types: list[str] | None = None):
+        def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None):
             return {"data": {"results": {}}}
 
-        def run_amapi_v3(self, path: str, *, method: str = "GET", body: dict[str, object] | None = None):
+        def run_amapi_v3(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None):
             return {"data": {"data": []}}
 
-    class FixedResolver:
+    class FixedResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1159,7 +1169,7 @@ def test_session_query_pool_fetches_100_results_as_two_paginated_calls(settings,
 
 
 def test_reject_current_track_marks_cached_entry_rejected_across_passes(service) -> None:
-    class FixedPoolResolver:
+    class FixedPoolResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1217,7 +1227,7 @@ def test_resolver_debug_log_resets_between_track_selection_episodes(settings, se
         config_path=settings.config_path,
     )
 
-    class EpisodeLoggingResolver:
+    class EpisodeLoggingResolver(FallbackResolver):
         def __init__(self) -> None:
             self.plan_calls = 0
 
@@ -1261,7 +1271,7 @@ def test_resolver_debug_log_resets_between_track_selection_episodes(settings, se
     second_log = debug_log_path.read_text(encoding="utf-8")
     assert "reason: adaptive-session-skip" in second_log
     assert "query-1" not in second_log
-    assert debug_service._resolver.plan_calls == 1
+    assert cast(Any, debug_service._resolver).plan_calls == 1
 
 
 def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp_path) -> None:
@@ -1290,7 +1300,7 @@ def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp
         config_path=settings.config_path,
     )
 
-    class EpisodeLoggingResolver:
+    class EpisodeLoggingResolver(FallbackResolver):
         def __init__(self) -> None:
             self.plan_calls = 0
 
@@ -1342,7 +1352,7 @@ def test_auto_advance_writes_fresh_resolver_debug_episode(settings, service, tmp
     second_log = debug_log_path.read_text(encoding="utf-8")
     assert "reason: adaptive-session-auto-advance" in second_log
     assert "auto-query-1" not in second_log
-    assert debug_service._resolver.plan_calls == 1
+    assert cast(Any, debug_service._resolver).plan_calls == 1
 
 
 def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp_path) -> None:
@@ -1381,9 +1391,9 @@ def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp
     session = debug_service._preferences.get_active_session()
     assert session is not None
 
-    debug_service._rpc.is_playing = False
-    debug_service._rpc.current_track["attributes"]["remainingTime"] = 0
-    debug_service._rpc.current_track["attributes"].pop("currentPlaybackTime", None)
+    cast(Any, debug_service._rpc).is_playing = False
+    cast(Any, debug_service._rpc).current_track["attributes"]["remainingTime"] = 0
+    cast(Any, debug_service._rpc).current_track["attributes"].pop("currentPlaybackTime", None)
     debug_service._session._set_session_runtime(session["id"], last_advance_at=0.0)
     debug_service._preferences.upsert_session_runtime(
         session["id"], last_advance_at="1970-01-01T00:00:00+00:00"
@@ -1404,7 +1414,7 @@ def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp
 
 
 def test_preserve_steering_keeps_session_query_pools(service) -> None:
-    class CacheFillingResolver:
+    class CacheFillingResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1435,7 +1445,7 @@ def test_preserve_steering_keeps_session_query_pools(service) -> None:
 
 
 def test_replace_steering_rebuilds_session_query_pools(service) -> None:
-    class CacheFillingResolver:
+    class CacheFillingResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1469,7 +1479,7 @@ def test_replace_steering_rebuilds_session_query_pools(service) -> None:
 
 
 def test_additive_steering_appends_session_search_query(service) -> None:
-    class CacheFillingResolver:
+    class CacheFillingResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1533,6 +1543,9 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
         def close(self) -> None:
             return None
 
+        def set_failure_callback(self, callback) -> None:
+            return None
+
         def playback_get(self, path: str):
             self.playback_get_calls.append(path)
             if path == "/now-playing":
@@ -1562,7 +1575,7 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+        def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0):
             return {
                 "data": {
                     "results": {
@@ -1584,7 +1597,13 @@ def test_session_planning_reuses_cached_playback_snapshot(settings, tmp_path) ->
                 }
             }
 
-    class SnapshotAwareResolver:
+        def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None):
+            return {"data": {"results": {}}}
+
+        def run_amapi_v3(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None):
+            return {"data": {"data": []}}
+
+    class SnapshotAwareResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(action="play_session", parameters={"request": text}, resolver="stub")
 
@@ -1734,7 +1753,7 @@ def test_playback_close_drains_in_flight_snapshot(service) -> None:
 
 
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
-    class RawStubResolver:
+    class RawStubResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(
                 action="status",
@@ -1778,7 +1797,7 @@ def test_handle_text_request_includes_raw_output_when_enabled(settings, service,
 
 
 def test_handle_text_request_preserves_debug_output_on_execution_error(settings, service, tmp_path) -> None:
-    class FailingStubResolver:
+    class FailingStubResolver(FallbackResolver):
         def resolve(self, text: str, service) -> ResolvedAction:
             return ResolvedAction(
                 action="play_candidate_match",
@@ -1848,7 +1867,13 @@ def test_play_candidate_match_falls_through_failed_query(settings) -> None:
         def close(self) -> None:
             return None
 
-        def search_catalog(self, query: str, *, limit: int, storefront: str, offset: int = 0):
+        def set_failure_callback(self, callback) -> None:
+            return None
+
+        def playback_get(self, path: str):
+            return {"value": True}
+
+        def search_catalog(self, query: str, *, limit: int = 10, storefront: str = "us", offset: int = 0):
             self.queries.append(query)
             if query == "hit":
                 return {
@@ -1874,6 +1899,12 @@ def test_play_candidate_match_falls_through_failed_query(settings) -> None:
 
         def playback_post(self, path: str, body=None):
             return {"path": path, "body": body}
+
+        def search_library(self, query: str, *, limit: int = 10, types: list[str] | None = None):
+            return {"data": {"results": {}}}
+
+        def run_amapi_v3(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None):
+            return {"data": {"data": []}}
 
     rpc = _QueryFallbackRpc()
     fallback_service = CiderAgentService(settings, rpc_client=rpc)
@@ -2085,7 +2116,9 @@ def test_active_stopped_session_remains_eligible_after_restart(settings, service
     session = restarted._preferences.get_active_session()
     assert session is not None
     assert restarted._get_session_runtime(session["id"])["suspended"] is False
-    assert restarted._preferences.get_session_runtime(session["id"])["active_intent"] == "active"
+    restarted_runtime = restarted._preferences.get_session_runtime(session["id"])
+    assert restarted_runtime is not None
+    assert restarted_runtime["active_intent"] == "active"
     # No current track is ambiguous: confirm across two stopped snapshots.
     assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is False
     assert restarted._session._should_advance_session(session, restarted.playback_snapshot()) is True

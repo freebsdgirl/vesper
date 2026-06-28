@@ -35,6 +35,7 @@ from .matching import (
     best_track_match,
     top_pool_order,
 )
+from .rpc import RpcClient
 from .validation import (
     validate_index,
     validate_limit_offset,
@@ -78,7 +79,7 @@ class SearchHost(Protocol):
 class SearchController:
     """Catalog search, library search, playlist lookups, and play-from-search."""
 
-    def __init__(self, host: SearchHost, *, rpc) -> None:
+    def __init__(self, host: SearchHost, *, rpc: RpcClient) -> None:
         self._host = host
         self._rpc = rpc
         self._genre_cache: dict[str, dict[str, str]] = {}
