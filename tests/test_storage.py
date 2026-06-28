@@ -122,3 +122,69 @@ def test_close_lifecycle_locks_drops_entry_for_path(settings, tmp_path) -> None:
     # Full teardown (used by the autouse conftest fixture) clears everything.
     sessions_module.close_lifecycle_locks()
     assert sessions_module._lifecycle_locks == {}
+
+
+def test_upsert_session_runtime_preserves_omitted_fields(settings) -> None:
+    # A None argument means "leave this field unchanged": the atomic
+    # COALESCE-based upsert must not clobber existing values. See #69.
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play some music")
+
+    # Seed a row with explicit values.
+    store.upsert_session_runtime(
+        session["id"],
+        active_intent="suspended",
+        last_advance_at="1970-01-01T00:00:00+00:00",
+        last_selected_track_id="track-1",
+        last_known_playback_state="playing",
+    )
+    # Update only one field; the rest must be preserved.
+    store.upsert_session_runtime(session["id"], last_selected_track_id="track-2")
+
+    runtime = store.get_session_runtime(session["id"])
+    assert runtime is not None
+    assert runtime["active_intent"] == "suspended"
+    assert runtime["last_advance_at"] == "1970-01-01T00:00:00+00:00"
+    assert runtime["last_known_playback_state"] == "playing"
+    assert runtime["last_selected_track_id"] == "track-2"
+
+
+def test_upsert_session_runtime_defaults_active_intent_for_new_row(settings) -> None:
+    # Inserting a runtime row with no explicit active_intent must still satisfy
+    # the NOT NULL DEFAULT 'active' constraint (COALESCE in the VALUES clause).
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play some music")
+
+    store.upsert_session_runtime(session["id"], last_advance_at="T0")
+    runtime = store.get_session_runtime(session["id"])
+    assert runtime is not None
+    assert runtime["active_intent"] == "active"
+    assert runtime["last_advance_at"] == "T0"
+
+
+def test_upsert_session_runtime_is_atomic_under_concurrency(settings) -> None:
+    # The atomic single-statement upsert (issue #69) must not lose updates when
+    # two writers concurrently upsert disjoint fields: both writes should land.
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play some music")
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            barrier.wait()
+            store.upsert_session_runtime(session["id"], last_selected_track_id="from-thread-A")
+        except BaseException as exc:  # pragma: no cover - records any failure
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert not errors
+    runtime = store.get_session_runtime(session["id"])
+    assert runtime is not None
+    assert runtime["last_selected_track_id"] == "from-thread-A"

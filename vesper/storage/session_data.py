@@ -126,20 +126,14 @@ def upsert_session_runtime(
     last_selected_track_id: str | None = None,
     last_known_playback_state: str | None = None,
 ) -> dict[str, Any]:
-    current = get_session_runtime(database_path, session_id) or {
-        "active_intent": "active",
-        "last_advance_at": None,
-        "last_selected_track_id": None,
-        "last_known_playback_state": None,
-    }
-    resolved_active_intent = current["active_intent"] if active_intent is None else active_intent
-    resolved_last_advance_at = current["last_advance_at"] if last_advance_at is None else last_advance_at
-    resolved_last_selected_track_id = (
-        current["last_selected_track_id"] if last_selected_track_id is None else last_selected_track_id
-    )
-    resolved_last_known_playback_state = (
-        current["last_known_playback_state"] if last_known_playback_state is None else last_known_playback_state
-    )
+    # Single atomic INSERT ... ON CONFLICT statement. A None argument means
+    # "leave this field unchanged": on conflict each column resolves to
+    # COALESCE(excluded.field, session_runtime.field), so an omitted (NULL)
+    # field preserves the existing value rather than overwriting it. This
+    # replaces the previous read-then-write across two transactions, which
+    # could lose a concurrent upsert (issue #69). For a new row, active_intent
+    # defaults to 'active' via COALESCE in the VALUES clause to satisfy the
+    # NOT NULL constraint.
     try:
         with connect(database_path) as connection:
             connection.execute(
@@ -152,20 +146,21 @@ def upsert_session_runtime(
                     last_known_playback_state,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, COALESCE(?, 'active'), ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(session_id) DO UPDATE SET
-                    active_intent = excluded.active_intent,
-                    last_advance_at = excluded.last_advance_at,
-                    last_selected_track_id = excluded.last_selected_track_id,
-                    last_known_playback_state = excluded.last_known_playback_state,
+                    active_intent = COALESCE(?, session_runtime.active_intent),
+                    last_advance_at = COALESCE(excluded.last_advance_at, session_runtime.last_advance_at),
+                    last_selected_track_id = COALESCE(excluded.last_selected_track_id, session_runtime.last_selected_track_id),
+                    last_known_playback_state = COALESCE(excluded.last_known_playback_state, session_runtime.last_known_playback_state),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     session_id,
-                    resolved_active_intent,
-                    resolved_last_advance_at,
-                    resolved_last_selected_track_id,
-                    resolved_last_known_playback_state,
+                    active_intent,
+                    last_advance_at,
+                    last_selected_track_id,
+                    last_known_playback_state,
+                    active_intent,
                 ),
             )
     except sqlite3.Error as exc:
