@@ -1664,6 +1664,68 @@ def test_playback_snapshot_reuses_instance_thread_pool(service) -> None:
     assert service._playback_ctrl._executor is executor_before
 
 
+def test_playback_close_drains_in_flight_snapshot(service) -> None:
+    # close() must wait for in-flight playback_snapshot() fan-out tasks to
+    # finish before returning, instead of orphaning worker threads with
+    # shutdown(wait=False) (issue #89).
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    ctrl = service._playback_ctrl
+    rpc = service._rpc
+
+    # Gate that keeps the first RPC call blocked until we release it.
+    gate = _threading.Event()
+    call_started = _threading.Event()
+
+    original_get = rpc.playback_get
+
+    def gated_playback_get(path: str):
+        if path == "/is-playing" and not gate.is_set():
+            call_started.set()
+            gate.wait(timeout=10)
+        return original_get(path)
+
+    rpc.playback_get = gated_playback_get
+
+    # Start a snapshot in a background thread. It will block on the gate.
+    snapshot_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test-snapshot")
+    snapshot_future = snapshot_executor.submit(ctrl.playback_snapshot)
+
+    assert call_started.wait(timeout=5), "gated RPC call should have started"
+
+    # Now call close() while the snapshot fan-out is in flight. It should
+    # not return until the in-flight tasks complete (after we release the
+    # gate). We verify ordering: close() blocks, then we release the gate,
+    # then close() returns.
+    close_done = _threading.Event()
+
+    def call_close():
+        ctrl.close()
+        close_done.set()
+
+    close_thread = _threading.Thread(target=call_close, name="test-close")
+    close_thread.start()
+
+    # close() should be blocked waiting for the in-flight future.
+    assert not close_done.wait(timeout=0.3), "close() should not return while tasks are in flight"
+
+    # Release the gate so the in-flight snapshot can complete.
+    gate.set()
+
+    # close() should now return promptly (within the drain timeout).
+    assert close_done.wait(timeout=6), "close() should return after in-flight tasks drain"
+    close_thread.join(timeout=5)
+
+    # The background snapshot should also have completed successfully.
+    snapshot_result = snapshot_future.result(timeout=5)
+    assert snapshot_result["status"] == "ok"
+    snapshot_executor.shutdown(wait=True)
+
+    # Restore the stub so the fixture teardown doesn't hit the gated version.
+    rpc.playback_get = original_get
+
+
 def test_handle_text_request_includes_raw_output_when_enabled(settings, service, tmp_path) -> None:
     class RawStubResolver:
         def resolve(self, text: str, service) -> ResolvedAction:
