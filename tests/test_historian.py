@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -297,15 +298,24 @@ def test_historian_unavailability_does_not_change_success(settings: Settings, tm
     assert "Historian delivery failed" in caplog.text
 
 
-def test_unexpected_sink_error_propagates_instead_of_being_swallowed(
-    settings: Settings, tmp_path: Path
+def test_unexpected_sink_error_is_logged_and_does_not_break_operations(
+    settings: Settings, tmp_path: Path, caplog
 ) -> None:
     """An unexpected (non-HistorianDeliveryError) failure from the historian
-    sink must propagate rather than be swallowed by the best-effort handler.
+    sink must not fail the surrounding operation.
 
-    Regression guard for issue #47: the bare ``except Exception`` in
-    ``CiderAgentService._emit`` used to mask any sink failure as a routine
-    delivery problem. It now narrows to ``HistorianDeliveryError``.
+    Historian delivery is best-effort (issue #90): any exception from the sink
+    -- whether ``HistorianDeliveryError``, an ``httpx.HTTPStatusError`` on a 4xx
+    response, or a genuinely unexpected error from a corrupted sink -- is caught
+    in ``EventEmitter.emit``, logged, and never allowed to propagate out of the
+    call path. ``HistorianDeliveryError`` is logged at warning level; anything
+    else is logged at error level with a traceback so genuine sink bugs remain
+    visible and actionable.
+
+    This supersedes the issue #47 regression guard, which asserted that
+    unexpected sink errors propagated. #90 makes the best-effort contract a hard
+    boundary so a Historian outage or bug can never break a user-facing music
+    operation.
     """
 
     class PoisonedSink:
@@ -320,8 +330,55 @@ def test_unexpected_sink_error_propagates_instead_of_being_swallowed(
 
     service = _service(settings, PoisonedSink(), tmp_path)
 
-    with pytest.raises(RuntimeError, match="sink is corrupted"):
-        service.pause()
+    with caplog.at_level(logging.ERROR, logger="vesper.events"):
+        result = service.pause()
+
+    # The user-facing operation succeeds despite the sink failure.
+    assert result["status"] == "ok"
+    # The unexpected sink error was logged at error level with a traceback.
+    error_records = [
+        record for record in caplog.records
+        if record.levelno == logging.ERROR and "Unexpected Historian sink error" in record.message
+    ]
+    assert error_records, "expected an error-level log for the unexpected sink failure"
+    assert "sink is corrupted" in error_records[0].message
+    assert error_records[0].exc_info is not None
+    assert error_records[0].exc_info[0] is RuntimeError
+
+
+def test_http_status_error_from_sink_does_not_break_operations(
+    settings: Settings, tmp_path: Path, caplog
+) -> None:
+    """A non-delivery exception the real HttpHistorianSink can raise -- here an
+    ``httpx.HTTPStatusError`` from a 4xx response -- must not escape
+    ``EventEmitter.emit`` and fail the user-facing operation (issue #90).
+
+    ``HttpHistorianSink._request`` re-raises ``httpx.HTTPStatusError`` for 4xx
+    responses rather than wrapping it in ``HistorianDeliveryError``. Before #90
+    that propagated out of ``emit``; it is now caught and logged at error level.
+    """
+
+    class HttpStatusErrorSink:
+        def emit(self, event):
+            raise httpx.HTTPStatusError(
+                "Historian returned HTTP 403",
+                request=httpx.Request("POST", "https://historian.test/v1/events"),
+                response=httpx.Response(403, request=httpx.Request("POST", "https://historian.test/v1/events")),
+            )
+
+        def emit_batch(self, events):
+            self.emit(events[0] if events else {"id": "noop"})
+
+        def close(self):
+            return None
+
+    service = _service(settings, HttpStatusErrorSink(), tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="vesper.events"):
+        result = service.pause()
+
+    assert result["status"] == "ok"
+    assert "Unexpected Historian sink error" in caplog.text
 
 
 def test_rpc_failures_emit_sanitized_event(settings: Settings, tmp_path: Path) -> None:

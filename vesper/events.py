@@ -11,6 +11,7 @@ imports the concrete service class.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Protocol
 
 from .historian import (
@@ -21,6 +22,8 @@ from .historian import (
     current_operation,
     operation_context,
 )
+
+_log = logging.getLogger(__name__)
 
 
 class EventHost(Protocol):
@@ -88,16 +91,27 @@ class EventEmitter:
             self._historian.emit(event)
         except HistorianDeliveryError as exc:
             # Historian delivery is best-effort: a failed delivery must never
-            # fail the surrounding operation. Only the documented delivery
-            # failure is swallowed (with a warning); unexpected sink failures
-            # propagate so they remain visible and actionable.
-            import logging
-
-            logging.getLogger(__name__).warning(
+            # fail the surrounding operation. The documented delivery failure
+            # is swallowed with a warning.
+            _log.warning(
                 "Historian delivery failed for event_id=%s type=%s: %s",
                 event["id"],
                 event_type,
                 exc,
+            )
+        except Exception as exc:
+            # Any other exception from the sink (e.g. httpx.HTTPStatusError on a
+            # 4xx response, httpx.RequestError on a network failure) is also
+            # best-effort and must not fail the surrounding operation (issue
+            # #90). It is logged at error level with a traceback so genuine sink
+            # bugs remain visible and actionable rather than propagating out of
+            # the call path and breaking a user-facing music operation.
+            _log.error(
+                "Unexpected Historian sink error for event_id=%s type=%s: %s",
+                event["id"],
+                event_type,
+                exc,
+                exc_info=True,
             )
         return str(event["id"])
 
