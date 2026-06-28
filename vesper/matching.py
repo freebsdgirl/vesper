@@ -16,7 +16,6 @@ def normalize_match_text(value: str | None) -> str:
     if value is None:
         return ""
     normalized = value.casefold()
-    normalized = normalized.replace("p!nk", "pink")
     normalized = re.sub(r"[^a-z0-9]+", " ", normalized)
     return " ".join(normalized.split())
 
@@ -80,20 +79,12 @@ def best_playlist_match(playlists: list[dict[str, Any]], *, playlist_name: str) 
 
 def artist_track_score(track: dict[str, Any]) -> tuple[int, int]:
     album = normalize_match_text(track.get("album"))
-    title = normalize_match_text(track.get("title"))
     album_score = 0
     if "greatest hits" in album:
         album_score += 5
     if "essential" in album:
         album_score += 4
-    if "so far" in album:
-        album_score += 3
-    if "the truth about love" in album:
-        album_score += 2
-    title_penalty = 0
-    if title == "pink" or title == "pink!":
-        title_penalty -= 3
-    return (album_score, title_penalty)
+    return (album_score, 0)
 
 
 def top_pool_order(
