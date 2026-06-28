@@ -21,7 +21,6 @@ from .historian import (
     current_operation,
     operation_context,
 )
-from .utils import _preference_target
 
 
 class EventHost(Protocol):

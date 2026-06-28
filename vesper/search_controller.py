@@ -35,7 +35,6 @@ from .matching import (
     best_track_match,
     top_pool_order,
 )
-from .resolver import SessionSearchSource
 from .validation import (
     validate_index,
     validate_limit_offset,
