@@ -25,12 +25,39 @@ The project is built around one principle: keep the main conversational agent le
 
 ## Install
 
+**For users (recommended):**
+
 ```bash
-uv sync --extra dev
-cp config.example.json config.json
+uv tool install git+https://github.com/randileeharper/vesper
+vesper config init
 ```
 
-Edit `config.json` for your Cider token and resolver settings. See [docs/configuration.md](docs/configuration.md) for the full configuration reference.
+This installs the `vesper` command and writes a default config to `~/.config/vesper/config.json`. Edit that file for your Cider token and resolver settings. See [docs/configuration.md](docs/configuration.md) for the full configuration reference.
+
+**For developers:**
+
+```bash
+git clone https://github.com/randileeharper/vesper.git
+cd vesper
+uv sync --extra dev
+cp vesper/config.example.json config.json   # or: vesper config init
+```
+
+See [docs/development.md](docs/development.md) for the local workflow.
+
+### Updating
+
+To update a tool install, reinstall to pull the latest:
+
+```bash
+uv tool install --force git+https://github.com/randileeharper/vesper
+```
+
+`uv tool upgrade vesper` does not work for git-based installs — it only upgrades tools installed by name from PyPI. To pin a specific release, install from a tag:
+
+```bash
+uv tool install git+https://github.com/randileeharper/vesper@v0.1.0
+```
 
 ## Quick Start
 

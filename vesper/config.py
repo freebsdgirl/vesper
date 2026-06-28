@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from importlib.resources import files
 from typing import Any
 
 from pydantic import (
@@ -59,6 +60,46 @@ def _load_json_config() -> tuple[dict[str, Any], Path | None]:
             raise CiderConfigError(f"Config file {path} must contain a JSON object.")
         return payload, path
     return {}, None
+
+
+def default_config_path() -> Path:
+    """Return the XDG config path Vesper loads by default.
+
+    This returns the XDG path (third in the lookup order), not the
+    first-resolved path. ``vesper config init`` writes here by default so
+    it lands at the standard location a non-clone user will load from. If
+    the user has ``VESPER_CONFIG_PATH`` set, they should pass ``--path``
+    to match that location.
+    """
+    return _xdg_config_home() / "vesper" / "config.json"
+
+
+def write_default_config(target: Path | None = None, *, force: bool = False) -> Path:
+    """Write the packaged template config to *target* (default: XDG path).
+
+    Returns the path written. Refuses to overwrite an existing file unless
+    *force* is True; otherwise a :class:`CiderConfigError` is raised so the
+    caller (e.g. the CLI) can surface a clear message.
+    """
+    destination = target if target is not None else default_config_path()
+    destination = Path(destination).expanduser()
+    try:
+        if destination.exists() and not force:
+            raise CiderConfigError(
+                f"Config file already exists at {destination}. "
+                "Use --force to overwrite it, or edit it directly."
+            )
+        template = files("vesper").joinpath("config.example.json").read_text(encoding="utf-8")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(template, encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise CiderConfigError(
+            "The packaged config template (config.example.json) could not be found. "
+            "Your Vesper install may be incomplete."
+        ) from exc
+    except OSError as exc:
+        raise CiderConfigError(f"Could not access or write {destination}: {exc}") from exc
+    return destination
 
 
 class Settings(BaseSettings):

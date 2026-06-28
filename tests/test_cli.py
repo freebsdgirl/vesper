@@ -10,6 +10,13 @@ from vesper import cli
 from vesper.errors import TextRequestExecutionError
 
 
+def _packaged_template() -> str:
+    """Return the packaged config template text (single source of truth)."""
+    from importlib.resources import files
+
+    return files("vesper").joinpath("config.example.json").read_text(encoding="utf-8")
+
+
 def _patch_service(monkeypatch, service: Any) -> None:
     """Make ``cli.service_context`` yield *service* and call its ``close()``."""
 
@@ -202,3 +209,55 @@ def test_serve_accepts_both_transports(monkeypatch) -> None:
     cli.main()
 
     assert captured["flags"] == (True, True)
+
+
+def test_config_init_writes_default_config(tmp_path, monkeypatch, capsys) -> None:
+    target = tmp_path / "vesper" / "config.json"
+    monkeypatch.setattr("sys.argv", ["vesper", "config", "init", "--path", str(target)])
+
+    # Deliberately not patching service_context: a fallthrough bug would try to
+    # start a real service and connect to Cider, failing the test loudly.
+    cli.main()
+
+    captured = capsys.readouterr()
+    assert str(target) in captured.out
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == _packaged_template()
+
+
+def test_config_init_refuses_overwrite(tmp_path, monkeypatch, capsys) -> None:
+    target = tmp_path / "config.json"
+    target.write_text("EXISTING", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["vesper", "config", "init", "--path", str(target)])
+
+    with pytest.raises(SystemExit, match="1"):
+        cli.main()
+
+    captured = capsys.readouterr()
+    assert "already exists" in captured.err
+    assert target.read_text(encoding="utf-8") == "EXISTING"
+
+
+def test_config_init_force_overwrites(tmp_path, monkeypatch, capsys) -> None:
+    target = tmp_path / "config.json"
+    target.write_text("EXISTING", encoding="utf-8")
+    monkeypatch.setattr("sys.argv", ["vesper", "config", "init", "--path", str(target), "--force"])
+
+    cli.main()
+
+    captured = capsys.readouterr()
+    assert str(target) in captured.out
+    assert target.read_text(encoding="utf-8") == _packaged_template()
+
+
+def test_config_init_writes_to_default_xdg_location(tmp_path, monkeypatch, capsys) -> None:
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["vesper", "config", "init"])  # no --path
+
+    cli.main()
+
+    expected_path = tmp_path / "vesper" / "config.json"
+    captured = capsys.readouterr()
+    assert str(expected_path) in captured.out
+    assert expected_path.exists()
+    assert expected_path.read_text(encoding="utf-8") == _packaged_template()

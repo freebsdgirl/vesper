@@ -12,10 +12,16 @@ Vesper loads runtime settings from a JSON config file plus environment-variable 
 
 Unknown config keys are rejected so typos fail early.
 
-Start from the example file:
+Start from the example file. Installed as a tool:
 
 ```bash
-cp config.example.json config.json
+vesper config init
+```
+
+This writes the packaged template to `~/.config/vesper/config.json` (use `--path` to choose a different location, `--force` to overwrite). In a clone you can also copy it directly:
+
+```bash
+cp vesper/config.example.json config.json
 ```
 
 ## Environment Overrides
