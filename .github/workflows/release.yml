@@ -20,6 +20,19 @@ jobs:
         with:
           enable-cache: true
           python-version: "3.12"   # project requires >=3.12; pin to ensure a compatible interpreter
+      - name: Install dependencies
+        # Pin the version for the test environment, matching CI. The real
+        # tag-derived version is used only by the `uv build` step below.
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: uv sync --extra dev
+      - name: Run tests
+        # Gate the build on a green test suite so a broken tag push is caught
+        # before it produces artifacts. Belt-and-suspenders: tags are
+        # controlled, but CI is not a strict prerequisite for pushing a tag.
+        env:
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: uv run pytest -q
       - name: Build sdist and wheel
         run: uv build
       - name: Upload artifacts

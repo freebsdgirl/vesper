@@ -1,5 +1,8 @@
 # Vesper
 
+[![CI](https://github.com/randileeharper/vesper/actions/workflows/ci.yml/badge.svg)](https://github.com/randileeharper/vesper/actions/workflows/ci.yml)
+[![Version](https://img.shields.io/github/v/tag/randileeharper/vesper?label=version)](https://github.com/randileeharper/vesper/tags)
+
 `Vesper` is a dedicated music-control agent for the [Cider](https://cider.sh/) Apple Music client. It gives humans and agent hosts a small, text-first interface for playback control, adaptive music sessions, playlist requests, and music preference memory.
 
 The project is built around one principle: keep the main conversational agent lean, and hand music work to a narrow specialist that knows how to talk to Cider.
