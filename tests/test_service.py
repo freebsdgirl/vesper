@@ -1531,14 +1531,19 @@ def test_auto_advance_debug_log_captures_decision_payload(settings, service, tmp
 
     started = debug_service._begin_resolver_debug_episode("adaptive-session-auto-advance-check")
     try:
+        # First stopped snapshot is blocked (awaiting second confirmation).
+        # Blocked decisions are no longer logged to avoid flooding the debug log
+        # every worker tick (5s); only advance=True decisions are logged. See #114.
         assert debug_service._session._should_advance_session(session, debug_service.playback_snapshot()) is False
+        # Second stopped snapshot confirms and advances — this IS logged.
+        assert debug_service._session._should_advance_session(session, debug_service.playback_snapshot()) is True
     finally:
         debug_service._end_resolver_debug_episode(started)
 
     log_text = debug_log_path.read_text(encoding="utf-8")
     assert "reason: adaptive-session-auto-advance-check" in log_text
     assert "=== session_auto_advance_evaluated ===" in log_text
-    assert '"blocked_by": "awaiting_second_stopped_snapshot"' in log_text
+    assert '"advance": true' in log_text
     assert '"track_state": "ambiguous"' in log_text
     assert '"track_id": "catalog-track-favorite"' in log_text
 

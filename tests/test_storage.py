@@ -291,3 +291,51 @@ def test_upsert_session_runtime_is_atomic_under_concurrency(settings) -> None:
     runtime = store.get_session_runtime(session["id"])
     assert runtime is not None
     assert runtime["last_selected_track_id"] == "from-thread-A"
+
+
+def test_record_and_list_recent_playlists(settings) -> None:
+    # Recording a playlist selection and listing it back. Used to populate the
+    # playlist-selection prompt context so the LLM can avoid repeats. See #115.
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play upbeat music")
+
+    store.record_recent_playlist(playlist_id="pl.aaa", name="Lizzo Essentials", session_id=session["id"])
+    store.record_recent_playlist(playlist_id="pl.bbb", name="Today's Hits", session_id=session["id"])
+    store.record_recent_playlist(playlist_id="pl.ccc", name="Pure Focus", session_id=session["id"])
+
+    recent = store.list_recent_playlists(limit=10)
+    assert len(recent) == 3
+    # Most recent first.
+    assert recent[0]["playlist_id"] == "pl.ccc"
+    assert recent[0]["name"] == "Pure Focus"
+    assert recent[1]["playlist_id"] == "pl.bbb"
+    assert recent[2]["playlist_id"] == "pl.aaa"
+
+
+def test_list_recent_playlists_deduplicates(settings) -> None:
+    # A playlist selected multiple times appears only once, at its most recent
+    # position. See #115.
+    store = PreferenceStore(settings.database_path)
+
+    store.record_recent_playlist(playlist_id="pl.aaa", name="Lizzo Essentials")
+    store.record_recent_playlist(playlist_id="pl.bbb", name="Today's Hits")
+    store.record_recent_playlist(playlist_id="pl.aaa", name="Lizzo Essentials")
+
+    recent = store.list_recent_playlists(limit=10)
+    assert len(recent) == 2
+    # pl.aaa is most recent (second selection), so it comes first.
+    assert recent[0]["playlist_id"] == "pl.aaa"
+    assert recent[1]["playlist_id"] == "pl.bbb"
+
+
+def test_list_recent_playlists_respects_limit(settings) -> None:
+    store = PreferenceStore(settings.database_path)
+
+    for i in range(15):
+        store.record_recent_playlist(playlist_id=f"pl.{i:03d}", name=f"Playlist {i}")
+
+    recent = store.list_recent_playlists(limit=5)
+    assert len(recent) == 5
+    # Most recent first.
+    assert recent[0]["playlist_id"] == "pl.014"
+    assert recent[4]["playlist_id"] == "pl.010"

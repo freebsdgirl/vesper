@@ -116,6 +116,45 @@ def test_vibe_source_selects_playlist_once_and_keeps_playlist_order(service, mon
     assert [entry["track"]["title"] for entry in pool["entries"]] == ["First", "Second"]
 
 
+def test_vibe_source_records_playlist_selection_for_recent_avoidance(service, monkeypatch) -> None:
+    # When the vibe flow selects a playlist, it must record it in
+    # recent_playlists so future sessions can avoid repeating it. See #115.
+    class Resolver:
+        def select_session_playlist(self, request, service, session, source, candidates):
+            return SessionTrackSelection(selected_index=1, resolver="stub")
+
+    service._resolver = Resolver()
+    monkeypatch.setattr(
+        service,
+        "_catalog_resource_search",
+        lambda term, resource_type, limit, storefront="us": [
+            {
+                "id": "playlist-1",
+                "type": "playlists",
+                "attributes": {"name": "Wrong", "curatorName": "Apple Music", "playlistType": "editorial"},
+            },
+            {
+                "id": "playlist-2",
+                "type": "playlists",
+                "attributes": {"name": "Upbeat Pop", "curatorName": "Apple Music Pop", "playlistType": "editorial"},
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "_catalog_relationship_tracks",
+        lambda path, storefront="us": [_track("song-1", "First", "Artist")],
+    )
+
+    source = SessionSearchSource(kind="vibe", term="upbeat pop")
+    service._session._ensure_session_query_pools({"id": 1, "request_text": "upbeat pop"}, [source])
+
+    recent = service._preferences.list_recent_playlists(limit=10)
+    assert len(recent) == 1
+    assert recent[0]["playlist_id"] == "playlist-2"
+    assert recent[0]["name"] == "Upbeat Pop"
+
+
 def test_vibe_source_rephrases_empty_playlist_search_before_failing(service, monkeypatch) -> None:
     searches: list[str] = []
     rephrase_calls: list[list[str]] = []

@@ -591,13 +591,21 @@ class SessionSourcesMixin:
             playlist_id = _clean_id(playlist.get("id"))
             if not playlist_id:
                 return [], {}
+            resolved_name = playlist.get("attributes", {}).get("name")
             tracks = self._host._catalog_relationship_tracks(f"/playlists/{playlist_id}/tracks")
             metadata = {
                 "resolved_playlist_id": playlist_id,
-                "resolved_name": playlist.get("attributes", {}).get("name"),
+                "resolved_name": resolved_name,
             }
             if attempt_source.term != source.term:
                 metadata["resolved_vibe_term"] = attempt_source.term
+            # Record this playlist selection so future vibe searches can avoid
+            # repeating it. See #115.
+            self._preferences.record_recent_playlist(
+                playlist_id=playlist_id,
+                name=resolved_name,
+                session_id=session.get("id"),
+            )
             self._host.append_session_debug_log(
                 stage="session_playlist_selected",
                 payload={

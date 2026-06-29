@@ -445,6 +445,15 @@ class OpenAICompatibleResolver:
         search_source: SessionSearchSource,
         candidates: list[dict[str, Any]],
     ) -> list[dict[str, str]]:
+        # Fetch recently-selected playlists so the LLM can avoid repeating
+        # them for generic vibe requests. See #115.
+        recent_playlists: list[dict[str, Any]] = []
+        preferences = getattr(service, "_preferences", None)
+        if preferences is not None:
+            recent_playlists = [
+                {"id": p["playlist_id"], "name": p.get("name")}
+                for p in preferences.list_recent_playlists(limit=10)
+            ]
         context = {
             "current_timestamp": service.current_timestamp(),
             "session_request": session.get("request_text"),
@@ -452,6 +461,7 @@ class OpenAICompatibleResolver:
             "search_source": {"kind": search_source.kind, "term": search_source.term},
             "candidates": candidates[:5],
             "preferred_languages": self._preferred_languages(),
+            "recent_playlists": recent_playlists,
         }
         system = load_prompt("playlist_selection")
         return [

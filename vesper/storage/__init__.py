@@ -263,5 +263,22 @@ class PreferenceStore:
             event_types=event_types,
         )
 
+    def record_recent_playlist(
+        self,
+        *,
+        playlist_id: str,
+        name: str | None,
+        session_id: int | None = None,
+    ) -> None:
+        return session_data.record_recent_playlist(
+            self._database_path,
+            playlist_id=playlist_id,
+            name=name,
+            session_id=session_id,
+        )
+
+    def list_recent_playlists(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        return session_data.list_recent_playlists(self._database_path, limit=limit)
+
 
 __all__ = ["PreferenceStore", "close_connections", "close_lifecycle_locks"]

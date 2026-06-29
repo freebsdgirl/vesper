@@ -258,6 +258,23 @@ def initialize(database_path: Path) -> None:
             ON session_queue_items(session_id, track_id)
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_playlists (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                playlist_id TEXT NOT NULL,
+                name TEXT,
+                session_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recent_playlists_created
+            ON recent_playlists(created_at DESC, id DESC)
+            """
+        )
 
 
 def ensure_session_runtime_columns(connection: sqlite3.Connection) -> None:

@@ -319,3 +319,58 @@ def list_session_events(
             }
         )
     return events
+
+
+def record_recent_playlist(
+    database_path: Path,
+    *,
+    playlist_id: str,
+    name: str | None,
+    session_id: int | None = None,
+) -> None:
+    """Record that a playlist was selected for an adaptive session.
+
+    Each selection is appended as a new row so the full history is preserved;
+    callers read the most recent N via :func:`list_recent_playlists`, which
+    deduplicates by playlist_id so a playlist selected multiple times only
+    appears once (at its most recent position). See #115.
+    """
+    try:
+        with connect(database_path) as connection:
+            connection.execute(
+                """
+                INSERT INTO recent_playlists (playlist_id, name, session_id)
+                VALUES (?, ?, ?)
+                """,
+                (playlist_id, name, session_id),
+            )
+    except sqlite3.Error as exc:
+        raise PreferenceStoreError(f"Could not record recent playlist: {exc}") from exc
+
+
+def list_recent_playlists(database_path: Path, *, limit: int = 10) -> list[dict[str, Any]]:
+    """Return the most recently selected playlists, deduplicated by playlist_id.
+
+    Returns most-recent-first. A playlist selected multiple times appears only
+    once, at its most recent position. Used to populate the playlist-selection
+    prompt context so the LLM can avoid repeating recent picks. See #115.
+    """
+    with connect(database_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT playlist_id, name, MAX(created_at) AS created_at, MAX(id) AS row_id
+            FROM recent_playlists
+            GROUP BY playlist_id
+            ORDER BY created_at DESC, row_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [
+        {
+            "playlist_id": row["playlist_id"],
+            "name": row["name"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]

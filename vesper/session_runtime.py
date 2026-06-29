@@ -266,6 +266,13 @@ class SessionRuntimeMixin:
         advance: bool,
         blocked_by: str | None,
     ) -> None:
+        # Only log when an advance actually happens. The worker evaluates
+        # every SESSION_REFILL_INTERVAL_SECONDS (5s), and the vast majority of
+        # decisions are "no, still playing" — logging every one of those fills
+        # the debug log with noise and burns disk. The advance=True event is
+        # the only decision worth persisting. See #114.
+        if not advance:
+            return
         decision_payload = dict(payload)
         decision_payload["decision"] = {
             "advance": advance,
