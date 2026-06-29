@@ -97,7 +97,7 @@ def get_session_runtime(database_path: Path, session_id: int) -> dict[str, Any] 
     with connect(database_path) as connection:
         row = connection.execute(
             """
-            SELECT session_id, active_intent, last_advance_at, last_selected_track_id, last_known_playback_state, pending_stop_track_id, pending_stop_observed_at, updated_at
+            SELECT session_id, active_intent, last_advance_at, last_selected_track_id, last_known_playback_state, pending_stop_track_id, pending_stop_observed_at, advance_in_progress, updated_at
             FROM session_runtime
             WHERE session_id = ?
             """,
@@ -113,6 +113,7 @@ def get_session_runtime(database_path: Path, session_id: int) -> dict[str, Any] 
         "last_known_playback_state": row["last_known_playback_state"],
         "pending_stop_track_id": row["pending_stop_track_id"],
         "pending_stop_observed_at": row["pending_stop_observed_at"],
+        "advance_in_progress": bool(row["advance_in_progress"]),
         "updated_at": row["updated_at"],
     }
 
@@ -125,6 +126,7 @@ def upsert_session_runtime(
     last_advance_at: str | None = None,
     last_selected_track_id: str | None = None,
     last_known_playback_state: str | None = None,
+    advance_in_progress: bool | None = None,
 ) -> dict[str, Any]:
     # Single atomic INSERT ... ON CONFLICT statement. A None argument means
     # "leave this field unchanged": on conflict each column resolves to
@@ -134,6 +136,14 @@ def upsert_session_runtime(
     # could lose a concurrent upsert (issue #69). For a new row, active_intent
     # defaults to 'active' via COALESCE in the VALUES clause to satisfy the
     # NOT NULL constraint.
+    #
+    # advance_in_progress is a bool stored as INTEGER NOT NULL DEFAULT 0. The
+    # COALESCE pattern still works because SQL COALESCE only treats NULL as
+    # "use the fallback"; a 0 (False) is non-NULL and is written as-is, while
+    # None (NULL) preserves the existing value. This lets one process set the
+    # flag True at the start of an advance and False at the end, visible to
+    # another process's worker so it does not advance prematurely. See #114.
+    advance_int = None if advance_in_progress is None else (1 if advance_in_progress else 0)
     try:
         with connect(database_path) as connection:
             connection.execute(
@@ -144,14 +154,23 @@ def upsert_session_runtime(
                     last_advance_at,
                     last_selected_track_id,
                     last_known_playback_state,
+                    advance_in_progress,
                     updated_at
                 )
-                VALUES (?, COALESCE(?, 'active'), ?, ?, ?, CURRENT_TIMESTAMP)
+                VALUES (?, COALESCE(?, 'active'), ?, ?, ?, COALESCE(?, 0), CURRENT_TIMESTAMP)
                 ON CONFLICT(session_id) DO UPDATE SET
                     active_intent = COALESCE(?, session_runtime.active_intent),
                     last_advance_at = COALESCE(excluded.last_advance_at, session_runtime.last_advance_at),
                     last_selected_track_id = COALESCE(excluded.last_selected_track_id, session_runtime.last_selected_track_id),
                     last_known_playback_state = COALESCE(excluded.last_known_playback_state, session_runtime.last_known_playback_state),
+                    -- advance_in_progress must be settable to False (0), so we
+                    -- cannot rely on COALESCE(excluded, existing) alone: the
+                    -- VALUES clause coerces a NULL param to 0 via COALESCE(?, 0),
+                    -- which would make `excluded` always 0 and never preserve the
+                    -- existing value. Instead bind the raw parameter and use a
+                    -- CASE: when it is NULL, preserve the existing value; otherwise
+                    -- write the explicit 0/1. See #114.
+                    advance_in_progress = CASE WHEN ? IS NULL THEN session_runtime.advance_in_progress ELSE ? END,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
@@ -160,7 +179,10 @@ def upsert_session_runtime(
                     last_advance_at,
                     last_selected_track_id,
                     last_known_playback_state,
+                    advance_int,
                     active_intent,
+                    advance_int,
+                    advance_int,
                 ),
             )
     except sqlite3.Error as exc:

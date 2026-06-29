@@ -526,6 +526,101 @@ def test_pending_stop_confirmation_persists_across_process_restart(settings, ser
     assert second._session._should_advance_session(restarted_session, second.playback_snapshot()) is True
 
 
+def test_advance_in_progress_persisted_blocks_cross_process_worker(settings, service, tmp_path) -> None:
+    # When a separate process (e.g. `vesper ask`) starts a session track, it
+    # persists advance_in_progress=True so the long-lived server's background
+    # worker does not see the queue-clear stop as a finished track and advance
+    # prematurely. This reproduces the skip bug: without the persisted flag,
+    # the worker sees is_playing=false during the CLI's startup and advances.
+    # See #114.
+    database_path = tmp_path / "cross-process-advance.db"
+    rpc = service._rpc.__class__()
+    first = CiderAgentService(
+        Settings(
+            http_host=settings.http_host,
+            http_port=settings.http_port,
+            public_base_url=settings.public_base_url,
+            cider_base_url=settings.cider_base_url,
+            cider_api_token=settings.cider_api_token,
+            default_search_source=settings.default_search_source,
+            resolver_backend=settings.resolver_backend,
+            resolver_base_url=settings.resolver_base_url,
+            resolver_model=settings.resolver_model,
+            resolver_api_key=settings.resolver_api_key,
+            resolver_include_reasoning=settings.resolver_include_reasoning,
+            resolver_include_raw_output=settings.resolver_include_raw_output,
+            response_detail=settings.response_detail,
+            session_recent_tracks_limit=settings.session_recent_tracks_limit,
+            global_recent_tracks_limit=settings.global_recent_tracks_limit,
+            request_timeout_seconds=settings.request_timeout_seconds,
+            verify_tls=settings.verify_tls,
+            log_level=settings.log_level,
+            database_path=database_path,
+            config_path=settings.config_path,
+        ),
+        rpc_client=rpc,
+        preference_store=PreferenceStore(database_path),
+        resolver=service._resolver.__class__(),
+    )
+    first.play_session("play upbeat music")
+    session = first._preferences.get_active_session()
+    assert session is not None
+
+    # Simulate a second process starting a session track: it sets and persists
+    # advance_in_progress=True (as _play_session_track now does at its start).
+    first._session._set_session_runtime(session["id"], advance_in_progress=True)
+    first._preferences.upsert_session_runtime(session["id"], advance_in_progress=True)
+
+    # The server's worker observes a stopped snapshot (queue was cleared).
+    rpc.is_playing = False
+    rpc.current_track = None
+    first._session._set_session_runtime(session["id"], last_advance_at=0.0)
+    first._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    # The worker must NOT advance: advance_in_progress is persisted True by
+    # the other process and _effective_session_runtime reads it.
+    assert first._session._should_advance_session(session, first.playback_snapshot()) is False
+
+    # Once the other process finishes and clears the flag, the worker can
+    # proceed (after the two-snapshot confirmation, as before). Clear the
+    # pending-stop confirmation first so the two-phase test is independent.
+    first._session._clear_pending_stop_confirmation(session["id"])
+    first._session._set_session_runtime(session["id"], advance_in_progress=False)
+    first._preferences.upsert_session_runtime(session["id"], advance_in_progress=False)
+    # First stopped snapshot arms the confirmation.
+    assert first._session._should_advance_session(session, first.playback_snapshot()) is False
+    # Second stopped snapshot confirms and advances.
+    assert first._session._should_advance_session(session, first.playback_snapshot()) is True
+
+
+def test_session_worker_does_not_advance_when_track_played_below_min_duration(service) -> None:
+    # Minimum-play-duration backstop: if the current track has a
+    # current_playback_time below SESSION_MIN_PLAY_SECONDS, don't advance even
+    # if Cider reports stopped. This catches buffering/startup noise where
+    # Cider briefly reports is_playing=false. See #114.
+    service.play_session("play upbeat music")
+    session = service._preferences.get_active_session()
+    assert session is not None
+
+    service._rpc.is_playing = False
+    # Track has barely started playing (3s, below the 10s threshold). Use an
+    # ambiguous remainingTime so the track would otherwise pass through to
+    # the two-snapshot confirmation path.
+    service._rpc.current_track["attributes"]["currentPlaybackTime"] = 3
+    service._rpc.current_track["attributes"]["remainingTime"] = 0
+    service._session._set_session_runtime(session["id"], last_advance_at=0.0)
+    service._preferences.upsert_session_runtime(session["id"], last_advance_at="1970-01-01T00:00:00+00:00")
+
+    assert service._session._should_advance_session(session, service.playback_snapshot()) is False
+
+    # Once playback time exceeds the threshold, the min-duration guard no
+    # longer blocks and the normal stop-confirmation logic resumes. With a
+    # genuinely-finished track (currentPlaybackTime past duration), the
+    # finished state skips the two-snapshot confirmation and advances.
+    service._rpc.current_track["attributes"]["currentPlaybackTime"] = 180
+    assert service._session._should_advance_session(session, service.playback_snapshot()) is True
+
+
 def test_preference_store_backfills_pending_stop_columns(tmp_path) -> None:
     import sqlite3
 
@@ -558,6 +653,41 @@ def test_preference_store_backfills_pending_stop_columns(tmp_path) -> None:
     store_runtime = store.get_session_runtime(1)
     assert store_runtime is not None
     assert store_runtime["pending_stop_track_id"] == "<missing>"
+
+
+def test_preference_store_backfills_advance_in_progress_column(tmp_path) -> None:
+    import sqlite3
+
+    database_path = tmp_path / "legacy-runtime-no-advance.db"
+    # Simulate a database written before advance_in_progress existed: the
+    # runtime table has pending_stop columns but lacks advance_in_progress.
+    with sqlite3.connect(database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE session_runtime (
+                session_id INTEGER PRIMARY KEY,
+                active_intent TEXT NOT NULL DEFAULT 'active',
+                last_advance_at TEXT,
+                last_selected_track_id TEXT,
+                last_known_playback_state TEXT,
+                pending_stop_track_id TEXT,
+                pending_stop_observed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute("INSERT INTO session_runtime (session_id) VALUES (1)")
+
+    # Instantiating the store runs the schema migration, adding the column.
+    store = PreferenceStore(database_path)
+    runtime = store.get_session_runtime(1)
+    assert runtime is not None
+    # Backfilled column defaults to False (0), never None.
+    assert runtime["advance_in_progress"] is False
+
+    # The upsert must work on the migrated schema.
+    store.upsert_session_runtime(1, advance_in_progress=True)
+    assert store.get_session_runtime(1)["advance_in_progress"] is True
 
 
 def test_active_session_reconcile_tolerates_empty_now_playing_info_list(settings, service) -> None:

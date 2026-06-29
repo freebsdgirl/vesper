@@ -172,6 +172,7 @@ class SessionHost(Protocol):
     SESSION_SEARCH_PAGE_LIMIT: int
     SESSION_STOREFRONT: str
     SESSION_ADVANCE_COOLDOWN_SECONDS: float
+    SESSION_MIN_PLAY_SECONDS: float
     PREFERENCE_SEED_SEARCH_LIMIT: int
     PREFERENCE_SEED_ARTIST_CAP: int
     PREFERENCE_SEED_POOL_QUERY: str
@@ -723,7 +724,20 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                 pending_stop_track_id=None,
                 pending_stop_observed_at=None,
             )
-            self._persist_session_runtime(session["id"], suspended=False, last_advance_at=self._host.current_timestamp())
+            # Persist last_advance_at AND advance_in_progress at the start, not
+            # the end, so a separate process's worker sees the in-flight
+            # advance (cross-process coordination) and the cooldown is measured
+            # from when the advance began rather than when it finished. The
+            # previous behavior persisted last_advance_at only at the end, so a
+            # `vesper ask` CLI process clearing Cider's queue and starting a
+            # track left a stale timestamp that the server worker's cooldown
+            # check could not catch. See #114.
+            self._persist_session_runtime(
+                session["id"],
+                suspended=False,
+                last_advance_at=self._host.current_timestamp(),
+                advance_in_progress=True,
+            )
             try:
                 self._check_worker_cancelled()
                 playback_started_at = time.perf_counter()
@@ -809,6 +823,7 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                     last_advance_at=self._host.current_timestamp(),
                     last_selected_track_id=_clean_id(lead_track.get("play_params", {}).get("id")),
                     last_known_playback_state="playing",
+                    advance_in_progress=False,
                 )
                 result = {
                     "status": "ok",
@@ -835,8 +850,11 @@ class SessionEngine(SessionRuntimeMixin, SessionSourcesMixin, SessionQueueMixin)
                 # unexpected) leaving ``_play_session_track`` must clear
                 # ``advance_in_progress`` so the session runtime is never
                 # wedged, then re-raise so the original error propagates
-                # unchanged. See issue #47.
+                # unchanged. See issue #47. Persist the clear too, so a crash
+                # in a separate process (e.g. `vesper ask`) does not leave the
+                # flag wedged True for another process's worker. See #114.
                 self._set_session_runtime(session["id"], advance_in_progress=False, planning_playback_snapshot=None)
+                self._persist_session_runtime(session["id"], advance_in_progress=False)
                 raise
 
     def _plan_session_query(self, session: dict[str, Any], *, count: int, force_replan: bool = False) -> SessionQueryPlan:

@@ -204,6 +204,7 @@ class PreferenceStore:
         last_advance_at: str | None = None,
         last_selected_track_id: str | None = None,
         last_known_playback_state: str | None = None,
+        advance_in_progress: bool | None = None,
     ) -> dict[str, Any]:
         return session_data.upsert_session_runtime(
             self._database_path,
@@ -212,6 +213,7 @@ class PreferenceStore:
             last_advance_at=last_advance_at,
             last_selected_track_id=last_selected_track_id,
             last_known_playback_state=last_known_playback_state,
+            advance_in_progress=advance_in_progress,
         )
 
     def update_session_pending_stop(

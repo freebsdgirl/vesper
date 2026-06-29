@@ -188,6 +188,13 @@ def initialize(database_path: Path) -> None:
                 pending_stop_track_id TEXT,
                 -- Same UTC ISO-8601 wall-clock format as last_advance_at.
                 pending_stop_observed_at TEXT,
+                -- Cross-process advance coordination. A separate process
+                -- (e.g. the `vesper ask` CLI) starting a session track sets
+                -- this so the long-lived server's background worker does not
+                -- see the queue-clear stop as a finished track and advance
+                -- prematurely. Mirrors the in-memory advance_in_progress
+                -- flag so a second process can observe it. See #114.
+                advance_in_progress INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY(session_id) REFERENCES sessions(id)
             )
@@ -264,3 +271,5 @@ def ensure_session_runtime_columns(connection: sqlite3.Connection) -> None:
         connection.execute("ALTER TABLE session_runtime ADD COLUMN pending_stop_track_id TEXT")
     if "pending_stop_observed_at" not in existing:
         connection.execute("ALTER TABLE session_runtime ADD COLUMN pending_stop_observed_at TEXT")
+    if "advance_in_progress" not in existing:
+        connection.execute("ALTER TABLE session_runtime ADD COLUMN advance_in_progress INTEGER NOT NULL DEFAULT 0")

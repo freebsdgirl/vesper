@@ -140,12 +140,30 @@ class SessionRuntimeMixin:
             "track_state": track_state,
             "seconds_since_last_advance": elapsed,
             "cooldown_seconds": self._host.SESSION_ADVANCE_COOLDOWN_SECONDS,
+            "min_play_seconds": self._host.SESSION_MIN_PLAY_SECONDS,
         }
         if runtime.get("suspended"):
             self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="session_suspended")
             return False
         if runtime.get("advance_in_progress"):
             self._log_session_auto_advance_decision(debug_payload, advance=False, blocked_by="advance_in_progress")
+            return False
+        # Minimum-play-duration backstop. If the current track has a
+        # current_playback_time below the threshold, it has not played long
+        # enough to be genuinely finished. Cider can report is_playing=false
+        # during buffering/startup with a near-zero playback time; without
+        # this guard that could satisfy the stop-confirmation and trigger a
+        # premature skip. The primary guard is the cross-process
+        # advance_in_progress flag; this catches noisy playback reporting. See #114.
+        current_playback_time = self._numeric_value(track.get("current_playback_time"))
+        if current_playback_time is not None and current_playback_time < self._host.SESSION_MIN_PLAY_SECONDS:
+            self._clear_pending_stop_confirmation(session["id"])
+            debug_payload["runtime_after_clear"] = self._session_runtime_confirmation_state(session["id"])
+            self._log_session_auto_advance_decision(
+                debug_payload,
+                advance=False,
+                blocked_by="min_play_duration_not_met",
+            )
             return False
         is_playing = playback.get("is_playing")
         if is_playing is True:
@@ -290,6 +308,14 @@ class SessionRuntimeMixin:
         if stored:
             runtime["pending_stop_track_id"] = stored.get("pending_stop_track_id")
             runtime["pending_stop_observed_at"] = stored.get("pending_stop_observed_at")
+        # advance_in_progress is cross-process state: a separate process (e.g.
+        # the `vesper ask` CLI) starting a session track sets it so this
+        # process's worker does not see the queue-clear stop as a finished
+        # track and advance prematurely. Persisted value is authoritative so a
+        # stale in-memory "not in progress" can't override another process's
+        # in-flight advance. See #114.
+        if stored:
+            runtime["advance_in_progress"] = bool(stored.get("advance_in_progress"))
         return runtime
 
     def _get_session_runtime(self, session_id: int) -> dict[str, Any]:
@@ -356,6 +382,7 @@ class SessionRuntimeMixin:
         last_selected_track_id: str | None = None,
         last_known_playback_state: str | None = None,
         preserve_last_advance: bool = False,
+        advance_in_progress: bool | None = None,
     ) -> None:
         runtime = self._preferences.get_session_runtime(session_id)
         resolved_last_advance_at = runtime.get("last_advance_at") if runtime and preserve_last_advance else last_advance_at
@@ -365,6 +392,7 @@ class SessionRuntimeMixin:
             last_advance_at=resolved_last_advance_at,
             last_selected_track_id=last_selected_track_id,
             last_known_playback_state=last_known_playback_state,
+            advance_in_progress=advance_in_progress,
         )
 
     def _seconds_since_runtime_timestamp(self, value: Any) -> float | None:

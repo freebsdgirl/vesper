@@ -47,6 +47,13 @@ class CiderAgentService:
 
     SESSION_REFILL_INTERVAL_SECONDS = 5.0
     SESSION_ADVANCE_COOLDOWN_SECONDS = 5.0
+    # Minimum seconds a track must have played before an auto-advance is
+    # considered. This is a backstop against Cider reporting is_playing=false
+    # during buffering/startup (when current_playback_time is near zero), which
+    # could otherwise satisfy the stop-confirmation and trigger a premature
+    # skip. The primary guard is the cross-process advance_in_progress flag,
+    # but this catches cases where Cider's playback reporting is noisy. See #114.
+    SESSION_MIN_PLAY_SECONDS = 10.0
     TRACK_SELECTION_POOL_SIZE = 3
     SESSION_SEARCH_RESULT_LIMIT = 100
     SESSION_SEARCH_PAGE_LIMIT = 50

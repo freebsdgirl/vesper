@@ -221,6 +221,7 @@ def test_upsert_session_runtime_preserves_omitted_fields(settings) -> None:
         last_advance_at="1970-01-01T00:00:00+00:00",
         last_selected_track_id="track-1",
         last_known_playback_state="playing",
+        advance_in_progress=True,
     )
     # Update only one field; the rest must be preserved.
     store.upsert_session_runtime(session["id"], last_selected_track_id="track-2")
@@ -231,6 +232,24 @@ def test_upsert_session_runtime_preserves_omitted_fields(settings) -> None:
     assert runtime["last_advance_at"] == "1970-01-01T00:00:00+00:00"
     assert runtime["last_known_playback_state"] == "playing"
     assert runtime["last_selected_track_id"] == "track-2"
+    # advance_in_progress was omitted (None) in the second upsert, so it must
+    # preserve the True value set in the seed. See #114.
+    assert runtime["advance_in_progress"] is True
+
+
+def test_upsert_session_runtime_advances_in_progress_can_be_cleared(settings) -> None:
+    # advance_in_progress is a bool stored as INTEGER NOT NULL DEFAULT 0. The
+    # COALESCE pattern must allow setting it False (0) after it was True,
+    # because 0 is non-NULL and is written as-is (unlike None which preserves).
+    # This is what _play_session_track does at the end of an advance. See #114.
+    store = PreferenceStore(settings.database_path)
+    session = store.start_session(request_text="play some music")
+
+    store.upsert_session_runtime(session["id"], advance_in_progress=True)
+    assert store.get_session_runtime(session["id"])["advance_in_progress"] is True
+
+    store.upsert_session_runtime(session["id"], advance_in_progress=False)
+    assert store.get_session_runtime(session["id"])["advance_in_progress"] is False
 
 
 def test_upsert_session_runtime_defaults_active_intent_for_new_row(settings) -> None:
